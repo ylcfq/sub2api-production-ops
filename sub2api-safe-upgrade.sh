@@ -41,6 +41,7 @@ HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-180}"
 STOP_TIMEOUT_SECONDS="${STOP_TIMEOUT_SECONDS:-60}"
 BACKUP_ROOT="${BACKUP_ROOT:-${STACK_DIR}/backups}"
 IMAGE_REPOSITORY="weishaw/sub2api"
+SCRIPT_VERSION="2026.07.24-status1"
 
 BACKUP_DIR=""
 ORIGINAL_COMPOSE_BACKUP=""
@@ -48,22 +49,81 @@ COMPOSE_EDITED=0
 CUTOVER_STARTED=0
 FAILURE_HANDLER_RUNNING=0
 AUTO_CUTOVER=0
+CURRENT_STAGE="初始化"
+CURRENT_STEP=0
+TOTAL_UPGRADE_STEPS=10
+STAGE_STARTED_AT=0
+UPGRADE_STARTED_AT=0
+CUTOVER_STARTED_AT=0
+CUTOVER_DURATION=0
+REDIS_CLI_MODE=""
+PUBLIC_HEALTH_STATUS="未检查"
 
 timestamp() {
   date '+%Y-%m-%d %H:%M:%S%z'
 }
 
 log() {
-  printf '[%s] %s\n' "$(timestamp)" "$*"
+  printf '[%s] [状态] %s\n' "$(timestamp)" "$*"
 }
 
 warn() {
-  printf '[%s] WARNING: %s\n' "$(timestamp)" "$*" >&2
+  printf '[%s] [警告] %s\n' "$(timestamp)" "$*" >&2
 }
 
 die() {
-  printf '[%s] ERROR: %s\n' "$(timestamp)" "$*" >&2
+  printf '[%s] [错误] %s\n' "$(timestamp)" "$*" >&2
   return 1
+}
+
+human_bytes() {
+  local bytes="${1:-0}"
+  awk -v value="${bytes}" '
+    function human(x) {
+      split("B KiB MiB GiB TiB", units, " ")
+      unit = 1
+      while (x >= 1024 && unit < 5) {
+        x /= 1024
+        unit++
+      }
+      if (unit == 1) {
+        return sprintf("%.0f %s", x, units[unit])
+      }
+      return sprintf("%.2f %s", x, units[unit])
+    }
+    BEGIN { print human(value + 0) }
+  '
+}
+
+format_duration() {
+  local total="${1:-0}"
+  local hours=$((total / 3600))
+  local minutes=$(((total % 3600) / 60))
+  local seconds=$((total % 60))
+
+  if (( hours > 0 )); then
+    printf '%d小时%02d分%02d秒' "${hours}" "${minutes}" "${seconds}"
+  elif (( minutes > 0 )); then
+    printf '%d分%02d秒' "${minutes}" "${seconds}"
+  else
+    printf '%d秒' "${seconds}"
+  fi
+}
+
+stage_start() {
+  CURRENT_STEP=$((CURRENT_STEP + 1))
+  CURRENT_STAGE="$1"
+  STAGE_STARTED_AT="${SECONDS}"
+  printf '\n'
+  printf '================================================================\n'
+  printf '[步骤 %d/%d] %s\n' \
+    "${CURRENT_STEP}" "${TOTAL_UPGRADE_STEPS}" "${CURRENT_STAGE}"
+  printf '================================================================\n'
+}
+
+stage_finish() {
+  local elapsed=$((SECONDS - STAGE_STARTED_AT))
+  log "步骤完成：${CURRENT_STAGE}（耗时 $(format_duration "${elapsed}")）"
 }
 
 usage() {
@@ -107,7 +167,7 @@ require_root() {
 require_commands() {
   local missing=()
   local command_name
-  for command_name in docker curl awk grep sed tar df sha256sum flock date stat tee; do
+  for command_name in docker curl awk grep sed tar df du sha256sum flock date stat tee seq; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
       missing+=("${command_name}")
     fi
@@ -197,7 +257,7 @@ fetch_latest_official_version() {
   local tag_name
   local version
 
-  log "Checking the latest official Wei-Shaw/sub2api release..." >&2
+  log "正在查询 Wei-Shaw/sub2api 官方最新正式版..." >&2
   release_json="$(
     curl --fail --silent --show-error --location \
       --retry 3 --retry-delay 2 \
@@ -217,7 +277,7 @@ fetch_latest_official_version() {
 
   version="${tag_name#v}"
   validate_version "${version}"
-  log "Latest official release: ${tag_name}" >&2
+  log "官方最新正式版：${tag_name}" >&2
   printf '%s\n' "${version}"
 }
 
@@ -226,42 +286,76 @@ free_space_gb() {
     awk 'NR == 2 { printf "%d\n", $4 / 1024 / 1024 }'
 }
 
+local_health_code() {
+  local code
+  code="$(
+    curl --silent --output /dev/null --write-out '%{http_code}' \
+      --connect-timeout 3 --max-time 10 \
+      "${LOCAL_HEALTH_URL}" 2>/dev/null || true
+  )"
+  if [[ -z "${code}" || "${code}" == "000" ]]; then
+    printf '连接失败\n'
+  else
+    printf '%s\n' "${code}"
+  fi
+}
+
 check_local_health() {
-  curl --fail --silent --show-error \
-    --connect-timeout 3 --max-time 10 \
-    -o /dev/null "${LOCAL_HEALTH_URL}"
+  [[ "$(local_health_code)" == "200" ]]
+}
+
+public_health_code() {
+  local code
+  [[ -n "${PUBLIC_HEALTH_URL}" ]] || {
+    printf '未设置\n'
+    return 0
+  }
+  code="$(
+    curl --silent --location --output /dev/null --write-out '%{http_code}' \
+      --connect-timeout 5 --max-time 15 \
+      "${PUBLIC_HEALTH_URL}" 2>/dev/null || true
+  )"
+  if [[ -z "${code}" || "${code}" == "000" ]]; then
+    printf '连接失败\n'
+  else
+    printf '%s\n' "${code}"
+  fi
 }
 
 check_public_health() {
   [[ -n "${PUBLIC_HEALTH_URL}" ]] || return 2
-  curl --fail --silent --show-error \
-    --connect-timeout 5 --max-time 15 \
-    -o /dev/null "${PUBLIC_HEALTH_URL}"
+  [[ "$(public_health_code)" == "200" ]]
 }
 
 print_status() {
   local current_image
+  local local_code
+  local public_code
   current_image="$(get_current_image)"
 
-  log "Compose image: ${current_image}"
-  log "Application health: $(container_health "${APP_CONTAINER}")"
-  log "PostgreSQL health: $(container_health "${PG_CONTAINER}")"
-  log "Redis health: $(container_health "${REDIS_CONTAINER}")"
-  log "Free space on ${STACK_DIR}: $(free_space_gb) GB"
+  log "Compose 当前镜像：${current_image}"
+  log "应用容器状态：$(container_health "${APP_CONTAINER}")"
+  log "PostgreSQL 状态：$(container_health "${PG_CONTAINER}")"
+  log "Redis 状态：$(container_health "${REDIS_CONTAINER}")"
+  log "${STACK_DIR} 可用空间：$(free_space_gb) GiB"
   compose ps
 
-  if check_local_health; then
-    log "Local health endpoint: OK (${LOCAL_HEALTH_URL})"
+  local_code="$(local_health_code)"
+  if [[ "${local_code}" == "200" ]]; then
+    log "本地健康检查：HTTP ${local_code} (${LOCAL_HEALTH_URL})"
   else
-    warn "Local health endpoint failed: ${LOCAL_HEALTH_URL}"
+    warn "本地健康检查失败：${local_code} (${LOCAL_HEALTH_URL})"
   fi
 
   if [[ -z "${PUBLIC_HEALTH_URL}" ]]; then
-    log "Public health endpoint: skipped (set PUBLIC_HEALTH_URL to enable it)"
-  elif check_public_health; then
-    log "Public health endpoint: OK (${PUBLIC_HEALTH_URL})"
+    log "公网健康检查：已跳过（未设置 PUBLIC_HEALTH_URL）"
   else
-    warn "Public health endpoint failed: ${PUBLIC_HEALTH_URL}"
+    public_code="$(public_health_code)"
+    if [[ "${public_code}" == "200" ]]; then
+      log "公网健康检查：HTTP ${public_code} (${PUBLIC_HEALTH_URL})"
+    else
+      warn "公网健康检查失败：${public_code} (${PUBLIC_HEALTH_URL})"
+    fi
   fi
 }
 
@@ -307,11 +401,13 @@ create_backup_directory() {
   install -d -m 700 "${BACKUP_DIR}"
   exec > >(tee -a "${BACKUP_DIR}/upgrade.log") 2>&1
 
-  log "Backup directory: ${BACKUP_DIR}"
+  log "本次备份目录：${BACKUP_DIR}"
 }
 
 backup_configuration() {
-  log "Backing up Compose and application configuration..."
+  local archive_size
+
+  log "正在复制 Compose、.env 和应用配置..."
 
   cp -a "${COMPOSE_FILE}" "${ORIGINAL_COMPOSE_BACKUP}"
   cp -a "${STACK_DIR}/.env" "${BACKUP_DIR}/.env"
@@ -325,6 +421,8 @@ backup_configuration() {
 
   tar --numeric-owner -czf "${BACKUP_DIR}/app-data.tar.gz" \
     -C "${STACK_DIR}" data
+  archive_size="$(stat -c '%s' "${BACKUP_DIR}/app-data.tar.gz")"
+  log "应用数据归档完成：$(human_bytes "${archive_size}")"
 
   {
     printf 'created_at=%s\n' "$(timestamp)"
@@ -337,24 +435,56 @@ backup_configuration() {
     printf 'redis_container_health=%s\n' "$(container_health "${REDIS_CONTAINER}")"
     printf 'stack_free_gb=%s\n' "$(free_space_gb)"
   } > "${BACKUP_DIR}/metadata.txt"
+  log "配置与应用数据备份完成。"
 }
 
 backup_postgresql() {
   local dump_tmp="${BACKUP_DIR}/sub2api.pgdump.partial"
   local dump_final="${BACKUP_DIR}/sub2api.pgdump"
+  local db_size
+  local dump_pid
+  local dump_rc
+  local written_bytes=0
+  local started_at="${SECONDS}"
+  local last_report="${SECONDS}"
 
-  log "Creating a fresh PostgreSQL custom-format dump..."
+  db_size="$(
+    docker exec "${PG_CONTAINER}" sh -lc \
+      'psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_size_pretty(pg_database_size(current_database()));"'
+  )"
+  log "数据库当前大小：${db_size}"
+  log "正在创建 PostgreSQL 自定义格式备份；下面显示的是实际已写入大小，不是估算百分比。"
   docker exec "${PG_CONTAINER}" sh -lc '
     if command -v nice >/dev/null 2>&1; then
       exec nice -n 10 pg_dump -Fc -U "$POSTGRES_USER" -d "$POSTGRES_DB"
     fi
     exec pg_dump -Fc -U "$POSTGRES_USER" -d "$POSTGRES_DB"
-  ' > "${dump_tmp}"
+  ' > "${dump_tmp}" &
+  dump_pid=$!
+
+  while kill -0 "${dump_pid}" >/dev/null 2>&1; do
+    sleep 2
+    if (( SECONDS - last_report >= 5 )); then
+      if [[ -f "${dump_tmp}" ]]; then
+        written_bytes="$(stat -c '%s' "${dump_tmp}")"
+      fi
+      log "PostgreSQL 备份进行中：已写入 $(human_bytes "${written_bytes}")，已耗时 $(format_duration "$((SECONDS - started_at))")"
+      last_report="${SECONDS}"
+    fi
+  done
+
+  if wait "${dump_pid}"; then
+    dump_rc=0
+  else
+    dump_rc=$?
+  fi
+  (( dump_rc == 0 )) ||
+    die "pg_dump 失败，退出码 ${dump_rc}；未进入容器切换阶段。"
 
   [[ -s "${dump_tmp}" ]] || die "PostgreSQL dump is empty."
   mv "${dump_tmp}" "${dump_final}"
 
-  log "Verifying PostgreSQL archive structure..."
+  log "正在用 pg_restore 校验备份目录结构..."
   docker exec -i "${PG_CONTAINER}" sh -lc \
     'exec pg_restore -l >/dev/null' < "${dump_final}"
 
@@ -364,12 +494,21 @@ backup_postgresql() {
   [[ -s "${BACKUP_DIR}/postgres-globals.sql" ]] ||
     die "PostgreSQL globals backup is empty."
 
-  log "PostgreSQL backup verified: $(stat -c '%s bytes' "${dump_final}")"
+  written_bytes="$(stat -c '%s' "${dump_final}")"
+  log "PostgreSQL 备份校验通过：$(human_bytes "${written_bytes}")，总耗时 $(format_duration "$((SECONDS - started_at))")"
 }
 
 redis_cli() {
-  if docker exec "${REDIS_CONTAINER}" \
-    env -u REDISCLI_AUTH redis-cli PING >/dev/null 2>&1; then
+  if [[ -z "${REDIS_CLI_MODE}" ]]; then
+    if docker exec "${REDIS_CONTAINER}" \
+      env -u REDISCLI_AUTH redis-cli PING >/dev/null 2>&1; then
+      REDIS_CLI_MODE="no-auth"
+    else
+      REDIS_CLI_MODE="container-auth"
+    fi
+  fi
+
+  if [[ "${REDIS_CLI_MODE}" == "no-auth" ]]; then
     docker exec "${REDIS_CONTAINER}" \
       env -u REDISCLI_AUTH redis-cli "$@"
     return
@@ -384,9 +523,19 @@ backup_redis() {
   local info
   local completed=0
   local attempt
+  local bgsave_response
+  local current_save_time
 
-  log "Requesting a non-blocking Redis BGSAVE..."
-  redis_cli BGSAVE >/dev/null
+  redis_cli PING >/dev/null
+  if [[ "${REDIS_CLI_MODE}" == "no-auth" ]]; then
+    log "Redis 连接状态：PONG（服务端未启用密码，已忽略容器内错误认证变量）"
+  else
+    log "Redis 连接状态：PONG（使用容器认证环境）"
+  fi
+
+  log "正在请求非阻塞 Redis BGSAVE..."
+  bgsave_response="$(redis_cli BGSAVE | tr -d '\r')"
+  log "Redis 返回：${bgsave_response}"
 
   for attempt in $(seq 1 60); do
     info="$(redis_cli INFO persistence | tr -d '\r')"
@@ -396,6 +545,12 @@ backup_redis() {
         break
       fi
       die "Redis reports that the last BGSAVE failed."
+    fi
+    if (( attempt == 1 || attempt % 5 == 0 )); then
+      current_save_time="$(
+        awk -F: '/^rdb_current_bgsave_time_sec:/ {print $2}' <<<"${info}"
+      )"
+      log "Redis BGSAVE 进行中：服务端计时 ${current_save_time:-未知} 秒"
     fi
     sleep 1
   done
@@ -408,11 +563,13 @@ backup_redis() {
   [[ -s "${BACKUP_DIR}/redis-dump.rdb" ]] ||
     die "Redis RDB backup is empty."
 
-  log "Redis backup verified: $(stat -c '%s bytes' "${BACKUP_DIR}/redis-dump.rdb")"
+  log "Redis RDB 备份完成并校验非空：$(human_bytes "$(stat -c '%s' "${BACKUP_DIR}/redis-dump.rdb")")"
 }
 
 write_and_verify_checksums() {
-  log "Writing and verifying backup checksums..."
+  local total_bytes
+
+  log "正在生成并逐项验证 SHA-256 校验值..."
   (
     cd "${BACKUP_DIR}"
     sha256sum \
@@ -435,13 +592,18 @@ write_and_verify_checksums() {
   )
 
   printf 'BACKUP_VERIFIED %s\n' "$(timestamp)" > "${BACKUP_DIR}/STATUS"
+  total_bytes="$(du -sb "${BACKUP_DIR}" | awk '{print $1}')"
+  log "全部备份校验通过：目录总大小 $(human_bytes "${total_bytes}")"
+  log "可恢复备份目录：${BACKUP_DIR}"
 }
 
 pull_target_image() {
   local target_image="$1"
   local image_platform
+  local image_size
+  local image_digest
 
-  log "Pulling target image without changing the running service: ${target_image}"
+  log "正在拉取目标镜像（此步骤不会触碰当前运行容器）：${target_image}"
   docker pull "${target_image}"
   docker image inspect "${target_image}" >/dev/null
 
@@ -452,11 +614,16 @@ pull_target_image() {
   )"
   [[ "${image_platform}" == "linux/amd64" ]] ||
     die "Unexpected target image platform: ${image_platform}"
+  image_size="$(docker image inspect -f '{{.Size}}' "${target_image}")"
+  image_digest="$(
+    docker image inspect -f '{{join .RepoDigests ", "}}' "${target_image}"
+  )"
 
   docker image inspect \
     -f 'target_image_id={{.Id}} target_repo_digests={{json .RepoDigests}}' \
     "${target_image}" > "${BACKUP_DIR}/target-image.txt"
-  log "Target image is present locally (${image_platform})."
+  log "目标镜像校验完成：平台 ${image_platform}，大小 $(human_bytes "${image_size}")"
+  log "目标镜像摘要：${image_digest:-未提供}"
 }
 
 confirm_cutover() {
@@ -464,18 +631,28 @@ confirm_cutover() {
   local target_version="$2"
   local expected="UPGRADE ${target_version}"
   local answer
+  local remaining
+  local wait_step
 
   if (( AUTO_CUTOVER == 1 )); then
     [[ "${AUTO_CUTOVER_WAIT_SECONDS}" =~ ^[0-9]+$ ]] ||
       die "AUTO_CUTOVER_WAIT_SECONDS must be a non-negative integer."
-    log "Automatic latest-release mode enabled; no keyboard confirmation will be requested."
-    log "Waiting ${AUTO_CUTOVER_WAIT_SECONDS}s before cutover..."
-    sleep "${AUTO_CUTOVER_WAIT_SECONDS}"
+    log "已启用全自动模式，不需要键盘确认。"
+    remaining="${AUTO_CUTOVER_WAIT_SECONDS}"
+    while (( remaining > 0 )); do
+      log "切换前安全等待：剩余 ${remaining} 秒；当前业务仍由旧容器正常提供。"
+      wait_step=5
+      if (( remaining < wait_step )); then
+        wait_step="${remaining}"
+      fi
+      sleep "${wait_step}"
+      remaining=$((remaining - wait_step))
+    done
     [[ "$(container_health "${APP_CONTAINER}")" == "healthy" ]] ||
       die "Application became unhealthy during the automatic cutover wait."
     check_local_health ||
       die "Local health endpoint failed during the automatic cutover wait."
-    log "Automatic pre-cutover health recheck passed."
+    log "切换前二次检查通过：旧应用 healthy，本地健康接口 HTTP 200。"
     return 0
   fi
 
@@ -507,7 +684,7 @@ replace_compose_image() {
 
   current_version_re="${current_version//./\\.}"
 
-  log "Updating only the Sub2API image tag in docker-compose.yml..."
+  log "正在修改 Compose 中唯一的应用镜像标签：${current_version} -> ${target_version}"
   sed -i -E \
     "s|^([[:space:]]*image:[[:space:]]*)${IMAGE_REPOSITORY}:${current_version_re}([[:space:]]*(#.*)?)\$|\\1${target_image}\\2|" \
     "${COMPOSE_FILE}"
@@ -516,52 +693,74 @@ replace_compose_image() {
   [[ "$(get_current_image)" == "${target_image}" ]] ||
     die "Image tag replacement did not produce the expected result."
   compose config -q
-  log "Compose validation passed with ${target_image}."
+  log "Compose 语法验证通过，待运行镜像：${target_image}"
 }
 
 wait_for_application_health() {
   local deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
   local state
+  local http_code
+  local started_at="${SECONDS}"
+  local last_report=-10
 
   while (( SECONDS < deadline )); do
     state="$(container_health "${APP_CONTAINER}")"
+    http_code="$(
+      curl --silent --output /dev/null --write-out '%{http_code}' \
+        --connect-timeout 2 --max-time 3 \
+        "${LOCAL_HEALTH_URL}" 2>/dev/null || true
+    )"
+    if [[ -z "${http_code}" || "${http_code}" == "000" ]]; then
+      http_code="连接失败"
+    fi
     if [[ "${state}" == "unhealthy" || "${state}" == "exited" || "${state}" == "dead" ]]; then
-      warn "Application container state: ${state}"
+      warn "应用容器进入失败状态：container=${state}，health HTTP=${http_code}"
       return 1
     fi
 
-    if [[ "${state}" == "healthy" ]] && check_local_health; then
-      log "Application is healthy."
+    if [[ "${state}" == "healthy" && "${http_code}" == "200" ]]; then
+      log "新应用已就绪：container=healthy，health HTTP=200，等待耗时 $(format_duration "$((SECONDS - started_at))")"
       return 0
+    fi
+    if (( SECONDS - last_report >= 4 )); then
+      log "等待新应用启动：container=${state}，health HTTP=${http_code}，已等待 $(format_duration "$((SECONDS - started_at))")"
+      last_report="${SECONDS}"
     fi
     sleep 2
   done
 
-  warn "Application did not become healthy within ${HEALTH_TIMEOUT_SECONDS} seconds."
+  warn "等待 ${HEALTH_TIMEOUT_SECONDS} 秒后应用仍未健康。"
   return 1
 }
 
 verify_target_migrations() {
+  local migration_rows
   local migration_count
 
-  migration_count="$(
+  migration_rows="$(
     docker exec -i "${PG_CONTAINER}" sh -lc \
       'exec psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
       <<'SQL'
-SELECT count(*)
+SELECT filename
 FROM schema_migrations
 WHERE filename IN (
   '172_composite_model_routes.sql',
   '185_group_reasoning_effort_policy.sql',
   '186_alipay_mobile_precreate_deep_link.sql',
   '186_group_auth_cache_image_generation.sql'
-);
+)
+ORDER BY filename;
 SQL
   )"
-  migration_count="$(tr -d '[:space:]' <<<"${migration_count}")"
+  migration_count="$(
+    awk 'NF {count++} END {print count + 0}' <<<"${migration_rows}"
+  )"
   [[ "${migration_count}" == "4" ]] ||
     die "Expected 4 target migrations, but database reports ${migration_count:-none}."
-  log "All four v0.1.164 database migrations are recorded."
+  log "数据库迁移记录核对通过（4/4）："
+  while IFS= read -r migration; do
+    [[ -n "${migration}" ]] && printf '  [已应用] %s\n' "${migration}"
+  done <<<"${migration_rows}"
 }
 
 save_container_logs() {
@@ -577,7 +776,7 @@ restore_old_application() {
   trap - ERR INT TERM
   set +e
 
-  warn "Starting automatic application rollback: ${reason}"
+  warn "开始自动回退应用镜像，原因：${reason}"
 
   if [[ -n "${BACKUP_DIR}" ]]; then
     save_container_logs "${BACKUP_DIR}/failed-target-container.log"
@@ -588,37 +787,68 @@ restore_old_application() {
     COMPOSE_EDITED=0
 
     if compose config -q; then
+      warn "原 Compose 已恢复，正在重新创建旧应用容器..."
       compose up -d --no-deps --force-recreate "${APP_SERVICE}"
       if wait_for_application_health; then
-        warn "Old application image has been restored and is healthy."
+        warn "自动回退成功：旧应用镜像已恢复并通过健康检查。"
         if [[ -n "${BACKUP_DIR}" ]]; then
           printf 'AUTO_ROLLBACK_COMPLETED %s\n' "$(timestamp)" \
             >> "${BACKUP_DIR}/STATUS"
         fi
       else
-        warn "Automatic rollback was attempted, but the old app is not healthy."
+        warn "自动回退已执行，但旧应用仍未通过健康检查。"
       fi
     else
-      warn "Original Compose file failed validation during rollback."
+      warn "自动回退失败：原 Compose 文件未通过语法验证。"
     fi
   else
-    warn "Original Compose backup is unavailable; automatic rollback was not possible."
+    warn "自动回退无法执行：找不到原 Compose 备份。"
   fi
 }
 
 handle_error() {
   local rc="$1"
   local line="$2"
+  local current_image="未知"
+  local app_state="未知"
+  local pg_state="未知"
+  local redis_state="未知"
 
   trap - ERR INT TERM
-  warn "Upgrade command failed at script line ${line} (exit ${rc})."
+  set +e
+  current_image="$(get_current_image 2>/dev/null || printf '未知')"
+  app_state="$(container_health "${APP_CONTAINER}")"
+  pg_state="$(container_health "${PG_CONTAINER}")"
+  redis_state="$(container_health "${REDIS_CONTAINER}")"
+
+  printf '\n' >&2
+  printf '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n' >&2
+  warn "升级失败"
+  warn "失败阶段：${CURRENT_STAGE}"
+  warn "脚本位置：第 ${line} 行；退出码：${rc}"
+  warn "当前 Compose 镜像：${current_image}"
+  warn "实时容器状态：应用=${app_state}，PostgreSQL=${pg_state}，Redis=${redis_state}"
+  if [[ -n "${BACKUP_DIR}" ]]; then
+    warn "备份目录：${BACKUP_DIR}"
+    warn "完整过程日志：${BACKUP_DIR}/upgrade.log"
+  fi
+
+  if (( CUTOVER_STARTED == 0 && COMPOSE_EDITED == 0 )); then
+    warn "失败发生在切换前：应用容器未停止，线上业务仍由原容器提供。"
+  elif (( CUTOVER_STARTED == 0 && COMPOSE_EDITED == 1 )); then
+    warn "Compose 已修改但尚未停容器；将恢复原 Compose。"
+  else
+    warn "已进入容器切换阶段；现在启动自动应用回退。"
+  fi
+
   if (( COMPOSE_EDITED == 1 || CUTOVER_STARTED == 1 )); then
     restore_old_application "upgrade failure"
   fi
   if [[ -n "${BACKUP_DIR}" ]]; then
-    printf 'UPGRADE_FAILED %s line=%s exit=%s\n' \
-      "$(timestamp)" "${line}" "${rc}" >> "${BACKUP_DIR}/STATUS"
+    printf 'UPGRADE_FAILED %s stage=%q line=%s exit=%s\n' \
+      "$(timestamp)" "${CURRENT_STAGE}" "${line}" "${rc}" >> "${BACKUP_DIR}/STATUS"
   fi
+  printf '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n' >&2
   exit "${rc}"
 }
 
@@ -639,6 +869,9 @@ perform_upgrade() {
   local current_image
   local target_image
 
+  UPGRADE_STARTED_AT="${SECONDS}"
+  CURRENT_STEP=0
+  log "Sub2API 安全升级脚本版本：${SCRIPT_VERSION}"
   require_root
   require_commands
   acquire_lock
@@ -655,11 +888,12 @@ perform_upgrade() {
   target_image="${IMAGE_REPOSITORY}:${target_version}"
 
   if [[ "${current_version}" == "${target_version}" ]]; then
-    log "Compose is already pinned to ${target_image}; nothing to upgrade."
+    log "当前 Compose 已经是官方最新版本 ${target_image}，无需升级。"
     print_status
     return 0
   fi
 
+  stage_start "只读预检当前生产环境"
   for container in "${APP_CONTAINER}" "${PG_CONTAINER}" "${REDIS_CONTAINER}"; do
     container_exists "${container}" || die "Container not found: ${container}"
     container_running "${container}" || die "Container is not running: ${container}"
@@ -675,45 +909,83 @@ perform_upgrade() {
   if (( $(free_space_gb) < MIN_FREE_GB )); then
     die "Insufficient free space for image pull and fresh backups."
   fi
+  log "预检结果：当前 ${current_image}，目标 ${target_image}"
+  print_status
+  stage_finish
 
   create_backup_directory "${current_version}" "${target_version}"
   trap 'handle_error $? $LINENO' ERR
   trap 'handle_signal INT' INT
   trap 'handle_signal TERM' TERM
 
-  log "Upgrade preparation: ${current_image} -> ${target_image}"
-  backup_configuration
-  pull_target_image "${target_image}"
-  backup_postgresql
-  backup_redis
-  write_and_verify_checksums
-  confirm_cutover "${current_version}" "${target_version}"
+  log "升级任务：${current_image} -> ${target_image}"
 
+  stage_start "备份 Compose、配置和应用数据"
+  backup_configuration
+  stage_finish
+
+  stage_start "拉取并校验目标 Docker 镜像"
+  pull_target_image "${target_image}"
+  stage_finish
+
+  stage_start "创建并验证 PostgreSQL 备份"
+  backup_postgresql
+  stage_finish
+
+  stage_start "创建并验证 Redis 备份"
+  backup_redis
+  stage_finish
+
+  stage_start "生成并核对全部备份校验值"
+  write_and_verify_checksums
+  stage_finish
+
+  stage_start "切换前等待与二次健康检查"
+  confirm_cutover "${current_version}" "${target_version}"
+  stage_finish
+
+  stage_start "修改 Compose 并切换应用容器"
   replace_compose_image "${current_version}" "${target_version}"
 
   CUTOVER_STARTED=1
-  log "Stopping only the application container with a ${STOP_TIMEOUT_SECONDS}s Docker timeout..."
+  CUTOVER_STARTED_AT="${SECONDS}"
+  log "开始停止旧应用容器；PostgreSQL、Redis、Caddy 不会停止。"
+  log "Docker 停止超时上限：${STOP_TIMEOUT_SECONDS} 秒"
   compose stop -t "${STOP_TIMEOUT_SECONDS}" "${APP_SERVICE}"
+  log "旧应用容器已停止，实时状态：$(container_health "${APP_CONTAINER}")"
 
-  log "Creating only the new application container; PostgreSQL and Redis remain running..."
+  log "正在使用 ${target_image} 创建新应用容器..."
   compose up -d --no-deps --force-recreate "${APP_SERVICE}"
+  log "新容器已创建，当前 Docker 状态：$(container_health "${APP_CONTAINER}")"
+  stage_finish
 
+  stage_start "等待新版本健康并验证数据库迁移"
   wait_for_application_health
+  CUTOVER_DURATION=$((SECONDS - CUTOVER_STARTED_AT))
 
   [[ "$(docker inspect -f '{{.Config.Image}}' "${APP_CONTAINER}")" == "${target_image}" ]] ||
     die "Running container does not use ${target_image}."
+  log "运行镜像核对通过：${target_image}"
 
   verify_target_migrations
   save_container_logs "${BACKUP_DIR}/post-upgrade-container.log"
+  log "新容器最近日志已保存：${BACKUP_DIR}/post-upgrade-container.log"
   compose ps
+  log "容器切换至健康状态耗时：$(format_duration "${CUTOVER_DURATION}")"
+  stage_finish
 
+  stage_start "检查公网入口并输出最终结果"
   if [[ -z "${PUBLIC_HEALTH_URL}" ]]; then
-    log "Public health check skipped because PUBLIC_HEALTH_URL is unset."
+    PUBLIC_HEALTH_STATUS="已跳过"
+    log "公网健康检查已跳过：未设置 PUBLIC_HEALTH_URL。"
   elif check_public_health; then
-    log "Public health endpoint is healthy."
+    PUBLIC_HEALTH_STATUS="HTTP 200"
+    log "公网健康检查通过：HTTP 200 (${PUBLIC_HEALTH_URL})"
   else
-    warn "Local app is healthy, but public health check failed. Inspect Caddy/DNS."
+    PUBLIC_HEALTH_STATUS="失败"
+    warn "本地应用健康，但公网健康检查失败；请检查 Caddy/DNS。"
   fi
+  stage_finish
 
   printf 'UPGRADE_SUCCESS %s target=%s\n' \
     "$(timestamp)" "${target_version}" >> "${BACKUP_DIR}/STATUS"
@@ -721,10 +993,21 @@ perform_upgrade() {
   CUTOVER_STARTED=0
   trap - ERR INT TERM
 
-  log "Upgrade completed successfully: ${current_version} -> ${target_version}"
-  log "Keep this backup and both Docker images until production is fully validated:"
-  log "  ${BACKUP_DIR}"
-  log "Do not run docker image prune yet."
+  printf '\n'
+  printf '################################################################\n'
+  if [[ "${PUBLIC_HEALTH_STATUS}" == "失败" ]]; then
+    printf '# 升级完成（公网检查存在告警）\n'
+  else
+    printf '# 升级成功\n'
+  fi
+  printf '################################################################\n'
+  log "版本：${current_version} -> ${target_version}"
+  log "总耗时：$(format_duration "$((SECONDS - UPGRADE_STARTED_AT))")"
+  log "容器切换至健康状态：$(format_duration "${CUTOVER_DURATION}")"
+  log "最终状态：应用=$(container_health "${APP_CONTAINER}")，PostgreSQL=$(container_health "${PG_CONTAINER}")，Redis=$(container_health "${REDIS_CONTAINER}")"
+  log "公网健康检查：${PUBLIC_HEALTH_STATUS}"
+  log "备份目录：${BACKUP_DIR}"
+  log "请保留旧镜像和此备份，确认稳定前不要运行 docker image prune。"
 }
 
 confirm_rollback() {
@@ -849,4 +1132,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
