@@ -368,13 +368,16 @@ backup_postgresql() {
 }
 
 redis_cli() {
-  local redis_args="$*"
-  docker exec "${REDIS_CONTAINER}" sh -lc "
-    if [ -n \"\${REDIS_PASSWORD:-}\" ]; then
-      exec redis-cli --no-auth-warning -a \"\$REDIS_PASSWORD\" ${redis_args}
-    fi
-    exec redis-cli ${redis_args}
-  "
+  if docker exec "${REDIS_CONTAINER}" \
+    env -u REDISCLI_AUTH redis-cli PING >/dev/null 2>&1; then
+    docker exec "${REDIS_CONTAINER}" \
+      env -u REDISCLI_AUTH redis-cli "$@"
+    return
+  fi
+
+  # Password-protected Redis containers commonly expose REDISCLI_AUTH. Let
+  # redis-cli consume that environment variable without printing the password.
+  docker exec "${REDIS_CONTAINER}" redis-cli "$@"
 }
 
 backup_redis() {
@@ -506,7 +509,7 @@ replace_compose_image() {
 
   log "Updating only the Sub2API image tag in docker-compose.yml..."
   sed -i -E \
-    "s#^([[:space:]]*image:[[:space:]]*)${IMAGE_REPOSITORY}:${current_version_re}([[:space:]]*(#.*)?)\$#\\1${target_image}\\2#" \
+    "s|^([[:space:]]*image:[[:space:]]*)${IMAGE_REPOSITORY}:${current_version_re}([[:space:]]*(#.*)?)\$|\\1${target_image}\\2|" \
     "${COMPOSE_FILE}"
   COMPOSE_EDITED=1
 
