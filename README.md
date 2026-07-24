@@ -16,6 +16,27 @@ The script is intentionally conservative:
 - automatically restores the old application image when the new local health check fails;
 - never performs an automatic database restore.
 
+## Human-readable live status
+
+Upgrade output is organized as ten explicit operational stages. It reports
+real observed values rather than invented percentages, including:
+
+- current and target image versions;
+- live container health and HTTP status;
+- database size and the PostgreSQL dump's actual bytes written and elapsed time;
+- Redis connectivity, BGSAVE state, and resulting RDB size;
+- target image platform, size, and digest;
+- backup checksums and total backup size;
+- automatic cutover countdown;
+- application container state while waiting for health;
+- each required migration recorded by the database;
+- total runtime, cutover-to-healthy duration, final container state, and log paths.
+
+On failure it prints the current stage, script line, exit code, active Compose
+image, all three container states, whether cutover had started, the backup
+directory, the full log path, and the automatic rollback outcome. Secrets and
+environment-variable values are not printed.
+
 ## Expected layout
 
 Defaults match this common Docker Compose layout:
