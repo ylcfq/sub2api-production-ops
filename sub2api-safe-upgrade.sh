@@ -42,7 +42,7 @@ HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-180}"
 STOP_TIMEOUT_SECONDS="${STOP_TIMEOUT_SECONDS:-60}"
 BACKUP_ROOT="${BACKUP_ROOT:-${STACK_DIR}/backups}"
 IMAGE_REPOSITORY="weishaw/sub2api"
-SCRIPT_VERSION="2026.07.24-cleanup1"
+SCRIPT_VERSION="2026.07.24-archive1"
 
 BACKUP_DIR=""
 ORIGINAL_COMPOSE_BACKUP=""
@@ -418,6 +418,8 @@ create_backup_directory() {
 
 backup_configuration() {
   local archive_size
+  local archive_tmp="${BACKUP_DIR}/app-data.tar.gz.partial"
+  local archive_final="${BACKUP_DIR}/app-data.tar.gz"
 
   log "正在复制 Compose、.env 和应用配置..."
 
@@ -431,10 +433,16 @@ backup_configuration() {
     cp -a "${STACK_DIR}/data/.installed" "${BACKUP_DIR}/.installed"
   fi
 
-  tar --numeric-owner -czf "${BACKUP_DIR}/app-data.tar.gz" \
+  log "正在归档应用数据；运行中的 data/logs/* 已排除（日志不是恢复数据）。"
+  tar --numeric-owner \
+    --exclude='data/logs/*' \
+    -czf "${archive_tmp}" \
     -C "${STACK_DIR}" data
-  archive_size="$(stat -c '%s' "${BACKUP_DIR}/app-data.tar.gz")"
-  log "应用数据归档完成：$(human_bytes "${archive_size}")"
+  [[ -s "${archive_tmp}" ]] || die "Application data archive is empty."
+  tar -tzf "${archive_tmp}" >/dev/null
+  mv "${archive_tmp}" "${archive_final}"
+  archive_size="$(stat -c '%s' "${archive_final}")"
+  log "应用数据归档完成并通过结构校验：$(human_bytes "${archive_size}")"
 
   {
     printf 'created_at=%s\n' "$(timestamp)"
@@ -446,6 +454,7 @@ backup_configuration() {
     printf 'postgres_container_health=%s\n' "$(container_health "${PG_CONTAINER}")"
     printf 'redis_container_health=%s\n' "$(container_health "${REDIS_CONTAINER}")"
     printf 'stack_free_gb=%s\n' "$(free_space_gb)"
+    printf 'app_data_excluded=%s\n' 'data/logs/*'
   } > "${BACKUP_DIR}/metadata.txt"
   log "配置与应用数据备份完成。"
 }
@@ -782,20 +791,27 @@ save_container_logs() {
 
 cleanup_partial_backup() {
   local partial_file
+  local partial_files=()
 
   [[ -n "${BACKUP_DIR}" && -d "${BACKUP_DIR}" ]] || return 0
-  partial_file="${BACKUP_DIR}/sub2api.pgdump.partial"
-  [[ -e "${partial_file}" ]] || return 0
+  partial_files=(
+    "${BACKUP_DIR}/app-data.tar.gz.partial"
+    "${BACKUP_DIR}/sub2api.pgdump.partial"
+  )
 
-  if [[ -f "${partial_file}" && ! -L "${partial_file}" ]]; then
-    if rm -f -- "${partial_file}"; then
-      log "已清理无效的 PostgreSQL 临时备份：${partial_file}"
+  for partial_file in "${partial_files[@]}"; do
+    [[ -e "${partial_file}" ]] || continue
+
+    if [[ -f "${partial_file}" && ! -L "${partial_file}" ]]; then
+      if rm -f -- "${partial_file}"; then
+        log "已清理无效的临时备份：${partial_file}"
+      else
+        warn "无法清理临时备份：${partial_file}"
+      fi
     else
-      warn "无法清理 PostgreSQL 临时备份：${partial_file}"
+      warn "发现非普通临时文件，出于安全考虑未删除：${partial_file}"
     fi
-  else
-    warn "发现非普通临时文件，出于安全考虑未删除：${partial_file}"
-  fi
+  done
 }
 
 delete_script_after_success() {
