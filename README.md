@@ -37,6 +37,27 @@ image, all three container states, whether cutover had started, the backup
 directory, the full log path, and the automatic rollback outcome. Secrets and
 environment-variable values are not printed.
 
+## Safe cleanup policy
+
+The script automatically removes only an incomplete
+`sub2api.pgdump.partial` file. It intentionally keeps verified backups, the
+previous application image, Docker volumes, and the upgrade script because
+they are useful for recovery.
+
+If you specifically want the downloaded installer removed after a completely
+successful upgrade, opt in with:
+
+```bash
+DELETE_SCRIPT_ON_SUCCESS=1 \
+PUBLIC_HEALTH_URL='https://your-domain.example/health' \
+bash /root/sub2api-safe-upgrade.sh upgrade-latest
+```
+
+Self-deletion is restricted to the regular file
+`/root/sub2api-safe-upgrade.sh`. The file is retained when the upgrade fails,
+automatic rollback is needed, or the public health check reports a warning.
+No backup, old image, volume, database file, or log is deleted by this option.
+
 ## Expected layout
 
 Defaults match this common Docker Compose layout:
@@ -104,7 +125,8 @@ curl -fsSL \
   https://raw.githubusercontent.com/ylcfq/sub2api-production-ops/main/sub2api-safe-upgrade.sh \
   -o /root/sub2api-safe-upgrade.sh \
   && chmod 700 /root/sub2api-safe-upgrade.sh \
-  && PUBLIC_HEALTH_URL='https://your-domain.example/health' \
+  && DELETE_SCRIPT_ON_SUCCESS=1 \
+  PUBLIC_HEALTH_URL='https://your-domain.example/health' \
   bash /root/sub2api-safe-upgrade.sh upgrade-latest
 ```
 

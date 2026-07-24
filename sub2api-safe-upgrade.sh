@@ -33,6 +33,7 @@ PG_CONTAINER="${PG_CONTAINER:-sub2api-postgres}"
 REDIS_CONTAINER="${REDIS_CONTAINER:-sub2api-redis}"
 LOCAL_HEALTH_URL="${LOCAL_HEALTH_URL:-http://127.0.0.1:8080/health}"
 PUBLIC_HEALTH_URL="${PUBLIC_HEALTH_URL:-}"
+DELETE_SCRIPT_ON_SUCCESS="${DELETE_SCRIPT_ON_SUCCESS:-0}"
 DEFAULT_TARGET_VERSION="${DEFAULT_TARGET_VERSION:-0.1.164}"
 OFFICIAL_LATEST_RELEASE_API="${OFFICIAL_LATEST_RELEASE_API:-https://api.github.com/repos/Wei-Shaw/sub2api/releases/latest}"
 AUTO_CUTOVER_WAIT_SECONDS="${AUTO_CUTOVER_WAIT_SECONDS:-30}"
@@ -41,7 +42,7 @@ HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-180}"
 STOP_TIMEOUT_SECONDS="${STOP_TIMEOUT_SECONDS:-60}"
 BACKUP_ROOT="${BACKUP_ROOT:-${STACK_DIR}/backups}"
 IMAGE_REPOSITORY="weishaw/sub2api"
-SCRIPT_VERSION="2026.07.24-status1"
+SCRIPT_VERSION="2026.07.24-cleanup1"
 
 BACKUP_DIR=""
 ORIGINAL_COMPOSE_BACKUP=""
@@ -58,6 +59,7 @@ CUTOVER_STARTED_AT=0
 CUTOVER_DURATION=0
 REDIS_CLI_MODE=""
 PUBLIC_HEALTH_STATUS="未检查"
+PUBLIC_HEALTH_FAILED=0
 
 timestamp() {
   date '+%Y-%m-%d %H:%M:%S%z'
@@ -151,6 +153,10 @@ Safety properties:
   - Pulls a version-pinned image.
   - Recreates only the Sub2API application container.
   - Leaves PostgreSQL, Redis, Caddy, volumes, and old images untouched.
+  - Removes only an incomplete PostgreSQL .partial file after failure/success.
+  - Keeps this script by default. Set DELETE_SCRIPT_ON_SUCCESS=1 to delete
+    only /root/sub2api-safe-upgrade.sh after a fully successful upgrade.
+  - Never deletes verified backups or old Docker images automatically.
   - Automatically restores the old application image if the new app is
     locally unhealthy.
   - Does not automatically restore PostgreSQL. Database restoration can
@@ -167,7 +173,7 @@ require_root() {
 require_commands() {
   local missing=()
   local command_name
-  for command_name in docker curl awk grep sed tar df du sha256sum flock date stat tee seq; do
+  for command_name in docker curl awk grep sed tar df du sha256sum flock date stat tee seq readlink rm; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
       missing+=("${command_name}")
     fi
@@ -250,6 +256,12 @@ validate_version() {
   local version="$1"
   [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
     die "Invalid release version: ${version}"
+}
+
+validate_cleanup_settings() {
+  [[ "${DELETE_SCRIPT_ON_SUCCESS}" == "0" ||
+    "${DELETE_SCRIPT_ON_SUCCESS}" == "1" ]] ||
+    die "DELETE_SCRIPT_ON_SUCCESS must be 0 or 1."
 }
 
 fetch_latest_official_version() {
@@ -768,6 +780,53 @@ save_container_logs() {
   docker logs --since 10m "${APP_CONTAINER}" > "${destination}" 2>&1 || true
 }
 
+cleanup_partial_backup() {
+  local partial_file
+
+  [[ -n "${BACKUP_DIR}" && -d "${BACKUP_DIR}" ]] || return 0
+  partial_file="${BACKUP_DIR}/sub2api.pgdump.partial"
+  [[ -e "${partial_file}" ]] || return 0
+
+  if [[ -f "${partial_file}" && ! -L "${partial_file}" ]]; then
+    if rm -f -- "${partial_file}"; then
+      log "已清理无效的 PostgreSQL 临时备份：${partial_file}"
+    else
+      warn "无法清理 PostgreSQL 临时备份：${partial_file}"
+    fi
+  else
+    warn "发现非普通临时文件，出于安全考虑未删除：${partial_file}"
+  fi
+}
+
+delete_script_after_success() {
+  local expected_path="/root/sub2api-safe-upgrade.sh"
+  local script_path
+
+  if [[ "${DELETE_SCRIPT_ON_SUCCESS}" != "1" ]]; then
+    log "升级脚本已保留：${BASH_SOURCE[0]}（便于 status/rollback；文件本身占用很小）"
+    return 0
+  fi
+
+  if (( PUBLIC_HEALTH_FAILED == 1 )); then
+    warn "公网健康检查存在告警，升级脚本将保留，不执行自动删除。"
+    return 0
+  fi
+
+  script_path="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+  if [[ "${script_path}" != "${expected_path}" ||
+    ! -f "${script_path}" ||
+    -L "${script_path}" ]]; then
+    warn "自动删除仅允许普通文件 ${expected_path}；当前路径为 ${script_path:-未知}，已跳过。"
+    return 0
+  fi
+
+  if rm -f -- "${script_path}"; then
+    log "升级已完整成功，安装脚本已按要求自动删除：${script_path}"
+  else
+    warn "升级已成功，但安装脚本自动删除失败：${script_path}"
+  fi
+}
+
 restore_old_application() {
   local reason="$1"
 
@@ -844,6 +903,7 @@ handle_error() {
   if (( COMPOSE_EDITED == 1 || CUTOVER_STARTED == 1 )); then
     restore_old_application "upgrade failure"
   fi
+  cleanup_partial_backup
   if [[ -n "${BACKUP_DIR}" ]]; then
     printf 'UPGRADE_FAILED %s stage=%q line=%s exit=%s\n' \
       "$(timestamp)" "${CURRENT_STAGE}" "${line}" "${rc}" >> "${BACKUP_DIR}/STATUS"
@@ -876,6 +936,7 @@ perform_upgrade() {
   require_commands
   acquire_lock
   validate_layout
+  validate_cleanup_settings
 
   if [[ "${target_version}" == "latest" ]]; then
     target_version="$(fetch_latest_official_version)"
@@ -977,12 +1038,15 @@ perform_upgrade() {
   stage_start "检查公网入口并输出最终结果"
   if [[ -z "${PUBLIC_HEALTH_URL}" ]]; then
     PUBLIC_HEALTH_STATUS="已跳过"
+    PUBLIC_HEALTH_FAILED=0
     log "公网健康检查已跳过：未设置 PUBLIC_HEALTH_URL。"
   elif check_public_health; then
     PUBLIC_HEALTH_STATUS="HTTP 200"
+    PUBLIC_HEALTH_FAILED=0
     log "公网健康检查通过：HTTP 200 (${PUBLIC_HEALTH_URL})"
   else
     PUBLIC_HEALTH_STATUS="失败"
+    PUBLIC_HEALTH_FAILED=1
     warn "本地应用健康，但公网健康检查失败；请检查 Caddy/DNS。"
   fi
   stage_finish
@@ -995,7 +1059,7 @@ perform_upgrade() {
 
   printf '\n'
   printf '################################################################\n'
-  if [[ "${PUBLIC_HEALTH_STATUS}" == "失败" ]]; then
+  if (( PUBLIC_HEALTH_FAILED == 1 )); then
     printf '# 升级完成（公网检查存在告警）\n'
   else
     printf '# 升级成功\n'
@@ -1008,6 +1072,8 @@ perform_upgrade() {
   log "公网健康检查：${PUBLIC_HEALTH_STATUS}"
   log "备份目录：${BACKUP_DIR}"
   log "请保留旧镜像和此备份，确认稳定前不要运行 docker image prune。"
+  cleanup_partial_backup
+  delete_script_after_success
 }
 
 confirm_rollback() {
