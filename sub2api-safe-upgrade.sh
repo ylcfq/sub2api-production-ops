@@ -16,6 +16,7 @@
 # Usage:
 #   bash sub2api-safe-upgrade.sh preflight
 #   bash sub2api-safe-upgrade.sh upgrade 0.1.164
+#   bash sub2api-safe-upgrade.sh upgrade-latest
 #   bash sub2api-safe-upgrade.sh status
 #   bash sub2api-safe-upgrade.sh rollback /www/sub2api/backups/upgrade-...
 #
@@ -33,6 +34,8 @@ REDIS_CONTAINER="${REDIS_CONTAINER:-sub2api-redis}"
 LOCAL_HEALTH_URL="${LOCAL_HEALTH_URL:-http://127.0.0.1:8080/health}"
 PUBLIC_HEALTH_URL="${PUBLIC_HEALTH_URL:-}"
 DEFAULT_TARGET_VERSION="${DEFAULT_TARGET_VERSION:-0.1.164}"
+OFFICIAL_LATEST_RELEASE_API="${OFFICIAL_LATEST_RELEASE_API:-https://api.github.com/repos/Wei-Shaw/sub2api/releases/latest}"
+AUTO_CUTOVER_WAIT_SECONDS="${AUTO_CUTOVER_WAIT_SECONDS:-30}"
 MIN_FREE_GB="${MIN_FREE_GB:-5}"
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-180}"
 STOP_TIMEOUT_SECONDS="${STOP_TIMEOUT_SECONDS:-60}"
@@ -44,6 +47,7 @@ ORIGINAL_COMPOSE_BACKUP=""
 COMPOSE_EDITED=0
 CUTOVER_STARTED=0
 FAILURE_HANDLER_RUNNING=0
+AUTO_CUTOVER=0
 
 timestamp() {
   date '+%Y-%m-%d %H:%M:%S%z'
@@ -70,17 +74,20 @@ Usage:
   bash sub2api-safe-upgrade.sh preflight
   bash sub2api-safe-upgrade.sh status
   bash sub2api-safe-upgrade.sh upgrade [target-version]
+  bash sub2api-safe-upgrade.sh upgrade-latest
   bash sub2api-safe-upgrade.sh rollback <upgrade-backup-directory>
 
 Examples:
   bash sub2api-safe-upgrade.sh preflight
   bash sub2api-safe-upgrade.sh upgrade 0.1.164
+  bash sub2api-safe-upgrade.sh upgrade-latest
   bash sub2api-safe-upgrade.sh rollback \
     /www/sub2api/backups/upgrade-0.1.162-to-0.1.164-20260724-153000
 
 Safety properties:
   - Backs up Compose, .env, application data, PostgreSQL, and Redis.
   - Verifies the PostgreSQL archive and backup checksums before cutover.
+  - `upgrade-latest` obtains the latest official non-prerelease GitHub release.
   - Pulls a version-pinned image.
   - Recreates only the Sub2API application container.
   - Leaves PostgreSQL, Redis, Caddy, volumes, and old images untouched.
@@ -183,6 +190,35 @@ validate_version() {
   local version="$1"
   [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
     die "Invalid release version: ${version}"
+}
+
+fetch_latest_official_version() {
+  local release_json
+  local tag_name
+  local version
+
+  log "Checking the latest official Wei-Shaw/sub2api release..." >&2
+  release_json="$(
+    curl --fail --silent --show-error --location \
+      --retry 3 --retry-delay 2 \
+      --connect-timeout 5 --max-time 30 \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      "${OFFICIAL_LATEST_RELEASE_API}"
+  )"
+
+  tag_name="$(
+    printf '%s\n' "${release_json}" |
+      grep -m1 '"tag_name"' |
+      sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'
+  )"
+  [[ -n "${tag_name}" ]] ||
+    die "GitHub latest-release response does not contain tag_name."
+
+  version="${tag_name#v}"
+  validate_version "${version}"
+  log "Latest official release: ${tag_name}" >&2
+  printf '%s\n' "${version}"
 }
 
 free_space_gb() {
@@ -426,6 +462,20 @@ confirm_cutover() {
   local expected="UPGRADE ${target_version}"
   local answer
 
+  if (( AUTO_CUTOVER == 1 )); then
+    [[ "${AUTO_CUTOVER_WAIT_SECONDS}" =~ ^[0-9]+$ ]] ||
+      die "AUTO_CUTOVER_WAIT_SECONDS must be a non-negative integer."
+    log "Automatic latest-release mode enabled; no keyboard confirmation will be requested."
+    log "Waiting ${AUTO_CUTOVER_WAIT_SECONDS}s before cutover..."
+    sleep "${AUTO_CUTOVER_WAIT_SECONDS}"
+    [[ "$(container_health "${APP_CONTAINER}")" == "healthy" ]] ||
+      die "Application became unhealthy during the automatic cutover wait."
+    check_local_health ||
+      die "Local health endpoint failed during the automatic cutover wait."
+    log "Automatic pre-cutover health recheck passed."
+    return 0
+  fi
+
   printf '\n'
   printf '%s\n' "Backup verification is complete."
   printf '%s\n' "Current version : ${current_version}"
@@ -590,6 +640,10 @@ perform_upgrade() {
   require_commands
   acquire_lock
   validate_layout
+
+  if [[ "${target_version}" == "latest" ]]; then
+    target_version="$(fetch_latest_official_version)"
+  fi
   validate_version "${target_version}"
 
   current_image="$(get_current_image)"
@@ -774,6 +828,10 @@ main() {
       ;;
     upgrade)
       perform_upgrade "${1:-${DEFAULT_TARGET_VERSION}}"
+      ;;
+    upgrade-latest)
+      AUTO_CUTOVER=1
+      perform_upgrade latest
       ;;
     rollback)
       perform_manual_rollback "${1:-}"
