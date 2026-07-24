@@ -40,9 +40,12 @@ environment-variable values are not printed.
 ## Safe cleanup policy
 
 The script automatically removes only an incomplete
-`sub2api.pgdump.partial` file. It intentionally keeps verified backups, the
-previous application image, Docker volumes, and the upgrade script because
-they are useful for recovery.
+`app-data.tar.gz.partial` or `sub2api.pgdump.partial` file. Live files under
+`data/logs/*` are excluded from the application-data archive because they are
+continuously written operational logs, not recovery data. The log directory
+itself is retained in the archive. The script intentionally keeps verified
+backups, the previous application image, Docker volumes, and the upgrade
+script because they are useful for recovery.
 
 If you specifically want the downloaded installer removed after a completely
 successful upgrade, opt in with:
