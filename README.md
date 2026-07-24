@@ -8,7 +8,8 @@ The script is intentionally conservative:
 
 - creates and verifies PostgreSQL, Redis, configuration, and application-data backups;
 - pulls a version-pinned Sub2API image;
-- requires an interactive low-traffic confirmation before cutover;
+- can discover the latest official non-prerelease GitHub release automatically;
+- retains an interactive explicit-version mode for controlled maintenance;
 - recreates only the Sub2API application container;
 - leaves PostgreSQL, Redis, Caddy, persistent volumes, and old images untouched;
 - verifies container health and the expected `v0.1.164` migrations;
@@ -68,20 +69,31 @@ Upgrade to `0.1.164`:
 bash /root/sub2api-safe-upgrade.sh upgrade 0.1.164
 ```
 
-One-command execution:
+Automatically discover and install the latest official release without a
+keyboard confirmation:
 
 ```bash
-PUBLIC_HEALTH_URL='https://your-domain.example/health' \
-  bash <(curl -fsSL \
-  https://raw.githubusercontent.com/ylcfq/sub2api-production-ops/main/sub2api-safe-upgrade.sh) \
-  upgrade 0.1.164
+bash /root/sub2api-safe-upgrade.sh upgrade-latest
 ```
 
-The script performs backups first, then pauses and requires:
+One-command automatic execution:
 
-```text
-UPGRADE 0.1.164
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/ylcfq/sub2api-production-ops/main/sub2api-safe-upgrade.sh \
+  -o /root/sub2api-safe-upgrade.sh \
+  && chmod 700 /root/sub2api-safe-upgrade.sh \
+  && PUBLIC_HEALTH_URL='https://your-domain.example/health' \
+  bash /root/sub2api-safe-upgrade.sh upgrade-latest
 ```
+
+Automatic mode obtains the release from GitHub's
+`Wei-Shaw/sub2api/releases/latest` API, validates the semantic version, creates
+and verifies all backups, waits 30 seconds, rechecks local health, and performs
+the cutover without prompting.
+
+The explicit-version `upgrade` command still pauses after backup and requires
+`UPGRADE <version>`.
 
 Status:
 
@@ -102,8 +114,9 @@ decision.
 
 ## Important
 
-Run upgrades in a maintenance window and confirm that no long-running or
-streaming request is active before entering the cutover confirmation.
+Run upgrades in a maintenance window. Automatic mode cannot prove that no
+long-running or streaming request is active, so start it only during a known
+low-traffic period.
 
 Do not use `docker compose down -v` or prune the old image until the upgraded
 deployment has been fully validated.
