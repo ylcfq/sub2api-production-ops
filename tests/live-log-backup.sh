@@ -43,9 +43,22 @@ printf '{}\n' > "${STACK_DIR}/data/model_pricing.json"
 ) &
 WRITER_PID=$!
 
-get_current_image() { printf 'weishaw/sub2api:0.1.162\n'; }
+get_current_image() { printf 'weishaw/sub2api:0.1.164\n'; }
 container_health() { printf 'healthy\n'; }
 free_space_gb() { printf '50\n'; }
+findmnt() {
+  case "${*: -1}" in
+    UUID)
+      printf 'test-uuid\n'
+      ;;
+    SOURCE)
+      printf '/dev/test\n'
+      ;;
+    FSTYPE)
+      printf 'ext4\n'
+      ;;
+  esac
+}
 docker() {
   case "${1:-}" in
     version)

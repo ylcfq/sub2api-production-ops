@@ -3,8 +3,9 @@
 # Safe upgrade/rollback helper for the current Sub2API production stack.
 #
 # Current server layout this script is written for:
-#   Stack directory : /www/sub2api
-#   Compose file    : /www/sub2api/docker-compose.yml
+#   Data mount      : /srv (dedicated ext4 disk)
+#   Stack directory : /srv/sub2api
+#   Compose file    : /srv/sub2api/docker-compose.yml
 #   App service     : sub2api
 #   PostgreSQL      : sub2api-postgres
 #   Redis           : sub2api-redis
@@ -15,17 +16,19 @@
 #
 # Usage:
 #   bash sub2api-safe-upgrade.sh preflight
-#   bash sub2api-safe-upgrade.sh upgrade 0.1.164
+#   bash sub2api-safe-upgrade.sh upgrade 0.1.165
 #   bash sub2api-safe-upgrade.sh upgrade-latest
 #   bash sub2api-safe-upgrade.sh status
-#   bash sub2api-safe-upgrade.sh rollback /www/sub2api/backups/upgrade-...
+#   bash sub2api-safe-upgrade.sh rollback /srv/sub2api/backups/upgrade-...
 #
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-STACK_DIR="${STACK_DIR:-/www/sub2api}"
+DATA_MOUNT="${DATA_MOUNT:-/srv}"
+EXPECTED_DATA_UUID="${EXPECTED_DATA_UUID:-0bdbc4d2-baf6-4496-8cc0-5097d5fafe23}"
+STACK_DIR="${STACK_DIR:-/srv/sub2api}"
 COMPOSE_FILE="${COMPOSE_FILE:-${STACK_DIR}/docker-compose.yml}"
 APP_SERVICE="${APP_SERVICE:-sub2api}"
 APP_CONTAINER="${APP_CONTAINER:-sub2api}"
@@ -34,18 +37,26 @@ REDIS_CONTAINER="${REDIS_CONTAINER:-sub2api-redis}"
 LOCAL_HEALTH_URL="${LOCAL_HEALTH_URL:-http://127.0.0.1:8080/health}"
 PUBLIC_HEALTH_URL="${PUBLIC_HEALTH_URL:-}"
 DELETE_SCRIPT_ON_SUCCESS="${DELETE_SCRIPT_ON_SUCCESS:-0}"
-DEFAULT_TARGET_VERSION="${DEFAULT_TARGET_VERSION:-0.1.164}"
+ALLOW_SCHEMA_MISMATCH_ROLLBACK="${ALLOW_SCHEMA_MISMATCH_ROLLBACK:-0}"
+DEFAULT_TARGET_VERSION="${DEFAULT_TARGET_VERSION:-0.1.165}"
 OFFICIAL_LATEST_RELEASE_API="${OFFICIAL_LATEST_RELEASE_API:-https://api.github.com/repos/Wei-Shaw/sub2api/releases/latest}"
+OFFICIAL_RELEASE_TAG_API_BASE="${OFFICIAL_RELEASE_TAG_API_BASE:-https://api.github.com/repos/Wei-Shaw/sub2api/releases/tags}"
+OFFICIAL_MIGRATIONS_API_BASE="${OFFICIAL_MIGRATIONS_API_BASE:-https://api.github.com/repos/Wei-Shaw/sub2api/contents/backend/migrations}"
+OFFICIAL_RAW_BASE="${OFFICIAL_RAW_BASE:-https://raw.githubusercontent.com/Wei-Shaw/sub2api}"
 AUTO_CUTOVER_WAIT_SECONDS="${AUTO_CUTOVER_WAIT_SECONDS:-30}"
-MIN_FREE_GB="${MIN_FREE_GB:-5}"
+MIN_FREE_GB="${MIN_FREE_GB:-8}"
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-180}"
 STOP_TIMEOUT_SECONDS="${STOP_TIMEOUT_SECONDS:-60}"
 BACKUP_ROOT="${BACKUP_ROOT:-${STACK_DIR}/backups}"
 IMAGE_REPOSITORY="weishaw/sub2api"
-SCRIPT_VERSION="2026.07.24-archive1"
+EXPECTED_IMAGE_SOURCE="https://github.com/Wei-Shaw/sub2api"
+SCRIPT_VERSION="2026.07.26-srv1"
 
 BACKUP_DIR=""
 ORIGINAL_COMPOSE_BACKUP=""
+MIGRATION_BASELINE_FILE=""
+MIGRATION_BASELINE_NAMES_FILE=""
+TARGET_MIGRATIONS_FILE=""
 COMPOSE_EDITED=0
 CUTOVER_STARTED=0
 FAILURE_HANDLER_RUNNING=0
@@ -141,24 +152,28 @@ Usage:
 
 Examples:
   bash sub2api-safe-upgrade.sh preflight
-  bash sub2api-safe-upgrade.sh upgrade 0.1.164
+  bash sub2api-safe-upgrade.sh upgrade 0.1.165
   bash sub2api-safe-upgrade.sh upgrade-latest
   bash sub2api-safe-upgrade.sh rollback \
-    /www/sub2api/backups/upgrade-0.1.162-to-0.1.164-20260724-153000
+    /srv/sub2api/backups/upgrade-0.1.164-to-0.1.165-20260726-153000
 
 Safety properties:
   - Backs up Compose, .env, application data, PostgreSQL, and Redis.
   - Verifies the PostgreSQL archive and backup checksums before cutover.
+  - Requires the dedicated /srv data disk and Docker mount guard.
   - `upgrade-latest` obtains the latest official non-prerelease GitHub release.
+  - Compares the target release's official migration manifest with the database.
   - Pulls a version-pinned image.
+  - Verifies the image's source/version labels and linux/amd64 platform.
   - Recreates only the Sub2API application container.
   - Leaves PostgreSQL, Redis, Caddy, volumes, and old images untouched.
   - Removes only an incomplete PostgreSQL .partial file after failure/success.
   - Keeps this script by default. Set DELETE_SCRIPT_ON_SUCCESS=1 to delete
     only /root/sub2api-safe-upgrade.sh after a fully successful upgrade.
   - Never deletes verified backups or old Docker images automatically.
-  - Automatically restores the old application image if the new app is
-    locally unhealthy.
+  - Automatically restores the old application image only when the database
+    migration set is unchanged. It refuses an unsafe image-only rollback after
+    forward-only migrations have changed the schema.
   - Does not automatically restore PostgreSQL. Database restoration can
     discard post-upgrade writes and must be an explicit recovery decision.
 USAGE
@@ -173,7 +188,10 @@ require_root() {
 require_commands() {
   local missing=()
   local command_name
-  for command_name in docker curl awk grep sed tar df du sha256sum flock date stat tee seq readlink rm; do
+  for command_name in \
+    docker curl awk grep sed tar df du sha256sum flock date stat tee seq \
+    readlink rm findmnt mountpoint systemctl sort comm cmp install cp mv \
+    tail tr sleep hostname diff; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
       missing+=("${command_name}")
     fi
@@ -197,7 +215,47 @@ compose() {
   )
 }
 
+validate_data_mount() {
+  local mount_uuid
+  local mount_fstype
+  local mount_options
+  local stack_mount_target
+  local docker_requires
+
+  [[ "${DATA_MOUNT}" == /* ]] ||
+    die "DATA_MOUNT must be an absolute path: ${DATA_MOUNT}"
+  [[ "${STACK_DIR}" == "${DATA_MOUNT}/"* ]] ||
+    die "STACK_DIR must be below ${DATA_MOUNT}: ${STACK_DIR}"
+  mountpoint -q "${DATA_MOUNT}" ||
+    die "${DATA_MOUNT} is not a mounted filesystem; refusing to use a system-disk fallback directory."
+
+  stack_mount_target="$(findmnt -n -T "${STACK_DIR}" -o TARGET)"
+  [[ "${stack_mount_target}" == "${DATA_MOUNT}" ]] ||
+    die "${STACK_DIR} is backed by ${stack_mount_target:-unknown}, expected ${DATA_MOUNT}."
+
+  mount_uuid="$(findmnt -n -T "${DATA_MOUNT}" -o UUID)"
+  mount_fstype="$(findmnt -n -T "${DATA_MOUNT}" -o FSTYPE)"
+  mount_options="$(findmnt -n -T "${DATA_MOUNT}" -o OPTIONS)"
+
+  [[ "${mount_uuid}" == "${EXPECTED_DATA_UUID}" ]] ||
+    die "Unexpected ${DATA_MOUNT} UUID: ${mount_uuid:-unknown}; expected ${EXPECTED_DATA_UUID}."
+  [[ "${mount_fstype}" == "ext4" ]] ||
+    die "Unexpected ${DATA_MOUNT} filesystem: ${mount_fstype:-unknown}; expected ext4."
+  [[ ",${mount_options}," == *,rw,* ]] ||
+    die "${DATA_MOUNT} is not mounted read-write."
+
+  docker_requires="$(systemctl show docker.service -p RequiresMountsFor --value)"
+  grep -Eq "(^|[[:space:]])${DATA_MOUNT}([[:space:]]|$)" <<<"${docker_requires}" ||
+    die "docker.service does not declare RequiresMountsFor=${DATA_MOUNT}."
+  systemctl cat docker.service |
+    grep -Fxq "AssertPathIsMountPoint=${DATA_MOUNT}" ||
+    die "docker.service does not assert that ${DATA_MOUNT} is a mount point."
+
+  log "数据盘保护通过：${DATA_MOUNT} (${mount_fstype}, UUID=${mount_uuid}, rw)，Docker 挂载依赖有效。"
+}
+
 validate_layout() {
+  validate_data_mount
   [[ -d "${STACK_DIR}" ]] || die "Stack directory not found: ${STACK_DIR}"
   [[ -f "${COMPOSE_FILE}" ]] || die "Compose file not found: ${COMPOSE_FILE}"
   [[ -f "${STACK_DIR}/.env" ]] || die ".env not found: ${STACK_DIR}/.env"
@@ -206,6 +264,8 @@ validate_layout() {
     die "PostgreSQL data directory is missing."
   [[ -d "${STACK_DIR}/redis_data" ]] ||
     die "Redis data directory is missing."
+  [[ "$(stat -c '%a' "${STACK_DIR}/.env")" == "600" ]] ||
+    die "${STACK_DIR}/.env must have mode 600."
 
   compose config -q
   compose config --services | grep -Fxq "${APP_SERVICE}" ||
@@ -224,6 +284,54 @@ container_health() {
   docker inspect -f \
     '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
     "$1" 2>/dev/null || printf 'missing'
+}
+
+container_mount_source() {
+  local container_name="$1"
+  local destination="$2"
+
+  docker inspect -f \
+    "{{range .Mounts}}{{if eq .Destination \"${destination}\"}}{{.Source}}{{end}}{{end}}" \
+    "${container_name}"
+}
+
+validate_runtime_layout() {
+  local app_mount
+  local pg_mount
+  local redis_mount
+  local app_binding
+  local pg_bindings
+  local redis_bindings
+  local compose_image
+  local runtime_image
+
+  app_mount="$(container_mount_source "${APP_CONTAINER}" "/app/data")"
+  pg_mount="$(container_mount_source "${PG_CONTAINER}" "/var/lib/postgresql/data")"
+  redis_mount="$(container_mount_source "${REDIS_CONTAINER}" "/data")"
+
+  [[ "$(readlink -f -- "${app_mount}")" == "$(readlink -f -- "${STACK_DIR}/data")" ]] ||
+    die "Application data mount mismatch: ${app_mount:-missing}"
+  [[ "$(readlink -f -- "${pg_mount}")" == "$(readlink -f -- "${STACK_DIR}/postgres_data")" ]] ||
+    die "PostgreSQL data mount mismatch: ${pg_mount:-missing}"
+  [[ "$(readlink -f -- "${redis_mount}")" == "$(readlink -f -- "${STACK_DIR}/redis_data")" ]] ||
+    die "Redis data mount mismatch: ${redis_mount:-missing}"
+
+  app_binding="$(docker port "${APP_CONTAINER}" 8080/tcp 2>/dev/null || true)"
+  [[ "${app_binding}" == "127.0.0.1:8080" ]] ||
+    die "Application port must be bound only to 127.0.0.1:8080; found ${app_binding:-no binding}."
+  pg_bindings="$(docker port "${PG_CONTAINER}" 2>/dev/null || true)"
+  redis_bindings="$(docker port "${REDIS_CONTAINER}" 2>/dev/null || true)"
+  [[ -z "${pg_bindings}" ]] ||
+    die "PostgreSQL unexpectedly publishes a host port: ${pg_bindings}"
+  [[ -z "${redis_bindings}" ]] ||
+    die "Redis unexpectedly publishes a host port: ${redis_bindings}"
+
+  compose_image="$(get_current_image)"
+  runtime_image="$(docker inspect -f '{{.Config.Image}}' "${APP_CONTAINER}")"
+  [[ "${runtime_image}" == "${compose_image}" ]] ||
+    die "Running application image ${runtime_image} differs from Compose ${compose_image}."
+
+  log "运行布局核对通过：三项持久化目录均位于 ${STACK_DIR}，仅应用端口绑定 127.0.0.1:8080。"
 }
 
 get_current_image() {
@@ -246,10 +354,53 @@ get_current_image() {
     sed -E 's/^[[:space:]]*image:[[:space:]]*([^[:space:]#]+).*$/\1/'
 }
 
+verify_image_identity() {
+  local image="$1"
+  local expected_version="$2"
+  local image_platform
+  local image_source
+  local image_version
+
+  docker image inspect "${image}" >/dev/null
+  image_platform="$(
+    docker image inspect -f '{{.Os}}/{{.Architecture}}' "${image}"
+  )"
+  image_source="$(
+    docker image inspect \
+      -f '{{index .Config.Labels "org.opencontainers.image.source"}}' \
+      "${image}"
+  )"
+  image_version="$(
+    docker image inspect \
+      -f '{{index .Config.Labels "org.opencontainers.image.version"}}' \
+      "${image}"
+  )"
+
+  [[ "${image_platform}" == "linux/amd64" ]] ||
+    die "Unexpected image platform for ${image}: ${image_platform}"
+  [[ "${image_source}" == "${EXPECTED_IMAGE_SOURCE}" ]] ||
+    die "Unexpected image source label for ${image}: ${image_source:-missing}"
+  [[ "${image_version}" == "${expected_version}" ]] ||
+    die "Unexpected image version label for ${image}: ${image_version:-missing}"
+}
+
 get_current_version() {
   local image
   image="$(get_current_image)"
-  printf '%s\n' "${image#${IMAGE_REPOSITORY}:}"
+  printf '%s\n' "${image#"${IMAGE_REPOSITORY}":}"
+}
+
+version_is_newer() {
+  local current="$1"
+  local target="$2"
+  local highest
+
+  highest="$(
+    printf '%s\n%s\n' "${current}" "${target}" |
+      sort -V |
+      tail -n 1
+  )"
+  [[ "${highest}" == "${target}" && "${current}" != "${target}" ]]
 }
 
 validate_version() {
@@ -262,6 +413,9 @@ validate_cleanup_settings() {
   [[ "${DELETE_SCRIPT_ON_SUCCESS}" == "0" ||
     "${DELETE_SCRIPT_ON_SUCCESS}" == "1" ]] ||
     die "DELETE_SCRIPT_ON_SUCCESS must be 0 or 1."
+  [[ "${ALLOW_SCHEMA_MISMATCH_ROLLBACK}" == "0" ||
+    "${ALLOW_SCHEMA_MISMATCH_ROLLBACK}" == "1" ]] ||
+    die "ALLOW_SCHEMA_MISMATCH_ROLLBACK must be 0 or 1."
 }
 
 fetch_latest_official_version() {
@@ -293,6 +447,110 @@ fetch_latest_official_version() {
   printf '%s\n' "${version}"
 }
 
+fetch_and_verify_official_release() {
+  local target_version="$1"
+  local release_file="${BACKUP_DIR}/target-release.json"
+  local api_url="${OFFICIAL_RELEASE_TAG_API_BASE}/v${target_version}"
+  local tag_name
+
+  log "正在确认 v${target_version} 是 Wei-Shaw/sub2api 官方正式 Release..."
+  curl --fail --silent --show-error --location \
+    --retry 3 --retry-delay 2 \
+    --connect-timeout 5 --max-time 30 \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'X-GitHub-Api-Version: 2022-11-28' \
+    "${api_url}" > "${release_file}"
+
+  tag_name="$(
+    grep -m1 '"tag_name"' "${release_file}" |
+      sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'
+  )"
+  [[ "${tag_name}" == "v${target_version}" ]] ||
+    die "Official release tag mismatch: expected v${target_version}, got ${tag_name:-missing}."
+  grep -Eq '"draft"[[:space:]]*:[[:space:]]*false' "${release_file}" ||
+    die "v${target_version} is a draft release; refusing production upgrade."
+  grep -Eq '"prerelease"[[:space:]]*:[[:space:]]*false' "${release_file}" ||
+    die "v${target_version} is a prerelease; refusing production upgrade."
+  log "官方 Release 校验通过：${tag_name}（非草稿、非预发布）。"
+}
+
+fetch_target_migration_manifest() {
+  local target_version="$1"
+  local response
+  local api_url="${OFFICIAL_MIGRATIONS_API_BASE}?ref=v${target_version}"
+  local migration_count
+
+  [[ -n "${BACKUP_DIR}" && -d "${BACKUP_DIR}" ]] ||
+    die "Backup directory is not initialized."
+  TARGET_MIGRATIONS_FILE="${BACKUP_DIR}/target-migrations.txt"
+
+  log "正在读取官方 v${target_version} 数据库迁移清单..."
+  response="$(
+    curl --fail --silent --show-error --location \
+      --retry 3 --retry-delay 2 \
+      --connect-timeout 5 --max-time 30 \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      "${api_url}"
+  )"
+  printf '%s\n' "${response}" |
+    grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+\.sql"' |
+    sed -E 's/^"name"[[:space:]]*:[[:space:]]*"([^"]+)"$/\1/' |
+    LC_ALL=C sort -u > "${TARGET_MIGRATIONS_FILE}"
+
+  migration_count="$(
+    awk 'NF {count++} END {print count + 0}' "${TARGET_MIGRATIONS_FILE}"
+  )"
+  (( migration_count > 0 )) ||
+    die "Official v${target_version} migration manifest is empty."
+  log "官方目标迁移清单已固定并保存：${migration_count} 个 SQL 文件。"
+}
+
+verify_upstream_deployment_contract() {
+  local current_version="$1"
+  local target_version="$2"
+  local current_compose="${BACKUP_DIR}/official-compose.current.yml"
+  local target_compose="${BACKUP_DIR}/official-compose.target.yml"
+  local current_env="${BACKUP_DIR}/official-env.current.example"
+  local target_env="${BACKUP_DIR}/official-env.target.example"
+  local changed=0
+
+  log "正在比较官方 v${current_version} 与 v${target_version} 的 Compose/.env 部署契约..."
+  curl --fail --silent --show-error --location \
+    --retry 3 --retry-delay 2 --connect-timeout 5 --max-time 30 \
+    "${OFFICIAL_RAW_BASE}/v${current_version}/deploy/docker-compose.local.yml" \
+    > "${current_compose}"
+  curl --fail --silent --show-error --location \
+    --retry 3 --retry-delay 2 --connect-timeout 5 --max-time 30 \
+    "${OFFICIAL_RAW_BASE}/v${target_version}/deploy/docker-compose.local.yml" \
+    > "${target_compose}"
+  curl --fail --silent --show-error --location \
+    --retry 3 --retry-delay 2 --connect-timeout 5 --max-time 30 \
+    "${OFFICIAL_RAW_BASE}/v${current_version}/deploy/.env.example" \
+    > "${current_env}"
+  curl --fail --silent --show-error --location \
+    --retry 3 --retry-delay 2 --connect-timeout 5 --max-time 30 \
+    "${OFFICIAL_RAW_BASE}/v${target_version}/deploy/.env.example" \
+    > "${target_env}"
+
+  if ! cmp -s "${current_compose}" "${target_compose}"; then
+    diff -u "${current_compose}" "${target_compose}" \
+      > "${BACKUP_DIR}/official-compose.diff" || true
+    warn "官方 docker-compose.local.yml 在两个版本之间发生变化。"
+    changed=1
+  fi
+  if ! cmp -s "${current_env}" "${target_env}"; then
+    diff -u "${current_env}" "${target_env}" \
+      > "${BACKUP_DIR}/official-env.diff" || true
+    warn "官方 .env.example 在两个版本之间发生变化。"
+    changed=1
+  fi
+  (( changed == 0 )) ||
+    die "Upstream deployment contract changed; automatic image-only upgrade is unsafe and requires manual review."
+
+  log "官方部署契约未变化；允许只替换 Sub2API 应用镜像。"
+}
+
 free_space_gb() {
   df -Pk "${STACK_DIR}" |
     awk 'NR == 2 { printf "%d\n", $4 / 1024 / 1024 }'
@@ -312,8 +570,21 @@ local_health_code() {
   fi
 }
 
+health_body_is_ok() {
+  local url="$1"
+  local body
+
+  body="$(
+    curl --fail --silent --show-error --location \
+      --connect-timeout 3 --max-time 10 \
+      "${url}" 2>/dev/null || true
+  )"
+  grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' <<<"${body}"
+}
+
 check_local_health() {
-  [[ "$(local_health_code)" == "200" ]]
+  [[ "$(local_health_code)" == "200" ]] &&
+    health_body_is_ok "${LOCAL_HEALTH_URL}"
 }
 
 public_health_code() {
@@ -336,7 +607,8 @@ public_health_code() {
 
 check_public_health() {
   [[ -n "${PUBLIC_HEALTH_URL}" ]] || return 2
-  [[ "$(public_health_code)" == "200" ]]
+  [[ "$(public_health_code)" == "200" ]] &&
+    health_body_is_ok "${PUBLIC_HEALTH_URL}"
 }
 
 print_status() {
@@ -353,20 +625,22 @@ print_status() {
   compose ps
 
   local_code="$(local_health_code)"
-  if [[ "${local_code}" == "200" ]]; then
-    log "本地健康检查：HTTP ${local_code} (${LOCAL_HEALTH_URL})"
+  if [[ "${local_code}" == "200" ]] &&
+    health_body_is_ok "${LOCAL_HEALTH_URL}"; then
+    log "本地健康检查：HTTP ${local_code} 且 status=ok (${LOCAL_HEALTH_URL})"
   else
-    warn "本地健康检查失败：${local_code} (${LOCAL_HEALTH_URL})"
+    warn "本地健康检查失败：HTTP=${local_code} 或响应不是 status=ok (${LOCAL_HEALTH_URL})"
   fi
 
   if [[ -z "${PUBLIC_HEALTH_URL}" ]]; then
     log "公网健康检查：已跳过（未设置 PUBLIC_HEALTH_URL）"
   else
     public_code="$(public_health_code)"
-    if [[ "${public_code}" == "200" ]]; then
-      log "公网健康检查：HTTP ${public_code} (${PUBLIC_HEALTH_URL})"
+    if [[ "${public_code}" == "200" ]] &&
+      health_body_is_ok "${PUBLIC_HEALTH_URL}"; then
+      log "公网健康检查：HTTP ${public_code} 且 status=ok (${PUBLIC_HEALTH_URL})"
     else
-      warn "公网健康检查失败：${public_code} (${PUBLIC_HEALTH_URL})"
+      warn "公网健康检查失败：HTTP=${public_code} 或响应不是 status=ok (${PUBLIC_HEALTH_URL})"
     fi
   fi
 }
@@ -383,6 +657,8 @@ run_preflight() {
     container_exists "${container}" || die "Container not found: ${container}"
     container_running "${container}" || die "Container is not running: ${container}"
   done
+  validate_runtime_layout
+  verify_image_identity "$(get_current_image)" "$(get_current_version)"
 
   [[ "$(container_health "${APP_CONTAINER}")" == "healthy" ]] ||
     die "Application container is not healthy."
@@ -391,6 +667,9 @@ run_preflight() {
   [[ "$(container_health "${REDIS_CONTAINER}")" == "healthy" ]] ||
     die "Redis container is not healthy."
   check_local_health || die "Local health endpoint is not healthy."
+  if [[ -n "${PUBLIC_HEALTH_URL}" ]]; then
+    check_public_health || die "Public health endpoint is not healthy."
+  fi
 
   free_gb="$(free_space_gb)"
   (( free_gb >= MIN_FREE_GB )) ||
@@ -408,6 +687,9 @@ create_backup_directory() {
   stamp="$(date '+%Y%m%d-%H%M%S')"
   BACKUP_DIR="${BACKUP_ROOT}/upgrade-${current_version}-to-${target_version}-${stamp}"
   ORIGINAL_COMPOSE_BACKUP="${BACKUP_DIR}/docker-compose.yml.before-upgrade"
+  MIGRATION_BASELINE_FILE="${BACKUP_DIR}/schema-migrations.before.tsv"
+  MIGRATION_BASELINE_NAMES_FILE="${BACKUP_DIR}/schema-migrations.before.txt"
+  TARGET_MIGRATIONS_FILE="${BACKUP_DIR}/target-migrations.txt"
 
   install -d -m 700 "${BACKUP_ROOT}"
   install -d -m 700 "${BACKUP_DIR}"
@@ -425,6 +707,15 @@ backup_configuration() {
 
   cp -a "${COMPOSE_FILE}" "${ORIGINAL_COMPOSE_BACKUP}"
   cp -a "${STACK_DIR}/.env" "${BACKUP_DIR}/.env"
+  cp -a /etc/fstab "${BACKUP_DIR}/fstab"
+  if [[ -f /etc/systemd/system/docker.service.d/10-requires-srv.conf ]]; then
+    cp -a \
+      /etc/systemd/system/docker.service.d/10-requires-srv.conf \
+      "${BACKUP_DIR}/docker-10-requires-srv.conf"
+  fi
+  if [[ -f /etc/caddy/Caddyfile ]]; then
+    cp -a /etc/caddy/Caddyfile "${BACKUP_DIR}/Caddyfile"
+  fi
 
   if [[ -f "${STACK_DIR}/data/config.yaml" ]]; then
     cp -a "${STACK_DIR}/data/config.yaml" "${BACKUP_DIR}/config.yaml"
@@ -447,6 +738,11 @@ backup_configuration() {
   {
     printf 'created_at=%s\n' "$(timestamp)"
     printf 'hostname=%s\n' "$(hostname)"
+    printf 'data_mount=%s\n' "${DATA_MOUNT}"
+    printf 'data_mount_uuid=%s\n' "$(findmnt -n -T "${DATA_MOUNT}" -o UUID)"
+    printf 'data_mount_source=%s\n' "$(findmnt -n -T "${DATA_MOUNT}" -o SOURCE)"
+    printf 'data_mount_fstype=%s\n' "$(findmnt -n -T "${DATA_MOUNT}" -o FSTYPE)"
+    printf 'stack_dir=%s\n' "${STACK_DIR}"
     printf 'source_image=%s\n' "$(get_current_image)"
     printf 'docker_version=%s\n' "$(docker version --format '{{.Server.Version}}')"
     printf 'compose_version=%s\n' "$(docker compose version --short)"
@@ -456,6 +752,7 @@ backup_configuration() {
     printf 'stack_free_gb=%s\n' "$(free_space_gb)"
     printf 'app_data_excluded=%s\n' 'data/logs/*'
   } > "${BACKUP_DIR}/metadata.txt"
+  compose config --images > "${BACKUP_DIR}/compose-images.before.txt"
   log "配置与应用数据备份完成。"
 }
 
@@ -515,8 +812,46 @@ backup_postgresql() {
   [[ -s "${BACKUP_DIR}/postgres-globals.sql" ]] ||
     die "PostgreSQL globals backup is empty."
 
+  query_schema_migrations > "${MIGRATION_BASELINE_FILE}"
+  [[ -s "${MIGRATION_BASELINE_FILE}" ]] ||
+    die "Database migration baseline is empty."
+  awk -F '|' 'NF {print $1}' "${MIGRATION_BASELINE_FILE}" |
+    LC_ALL=C sort -u > "${MIGRATION_BASELINE_NAMES_FILE}"
+
   written_bytes="$(stat -c '%s' "${dump_final}")"
   log "PostgreSQL 备份校验通过：$(human_bytes "${written_bytes}")，总耗时 $(format_duration "$((SECONDS - started_at))")"
+  log "迁移基线已保存：$(awk 'NF {count++} END {print count + 0}' "${MIGRATION_BASELINE_NAMES_FILE}") 条。"
+}
+
+verify_baseline_against_target_manifest() {
+  local missing_from_target="${BACKUP_DIR}/baseline-missing-from-target.txt"
+  local baseline_count
+  local target_count
+
+  [[ -s "${MIGRATION_BASELINE_NAMES_FILE}" ]] ||
+    die "Migration baseline names file is missing."
+  [[ -s "${TARGET_MIGRATIONS_FILE}" ]] ||
+    die "Official target migration manifest is missing."
+
+  LC_ALL=C comm -23 \
+    "${MIGRATION_BASELINE_NAMES_FILE}" \
+    "${TARGET_MIGRATIONS_FILE}" > "${missing_from_target}"
+  if [[ -s "${missing_from_target}" ]]; then
+    warn "目标版本缺少当前数据库已经应用的迁移："
+    sed 's/^/  [目标缺失] /' "${missing_from_target}" >&2
+    die "Target release migration set is not a forward-compatible superset; refusing upgrade."
+  fi
+  rm -f -- "${missing_from_target}"
+
+  baseline_count="$(
+    awk 'NF {count++} END {print count + 0}' "${MIGRATION_BASELINE_NAMES_FILE}"
+  )"
+  target_count="$(
+    awk 'NF {count++} END {print count + 0}' "${TARGET_MIGRATIONS_FILE}"
+  )"
+  (( target_count >= baseline_count )) ||
+    die "Target migration count ${target_count} is below baseline ${baseline_count}."
+  log "升级方向核对通过：数据库基线 ${baseline_count} 条，v${1} 官方目标 ${target_count} 条。"
 }
 
 redis_cli() {
@@ -546,6 +881,8 @@ backup_redis() {
   local attempt
   local bgsave_response
   local current_save_time
+  local container_rdb_sha
+  local backup_rdb_sha
 
   redis_cli PING >/dev/null
   if [[ "${REDIS_CLI_MODE}" == "no-auth" ]]; then
@@ -578,13 +915,25 @@ backup_redis() {
 
   (( completed == 1 )) || die "Redis BGSAVE did not finish within 60 seconds."
 
+  docker exec "${REDIS_CONTAINER}" sh -lc \
+    'command -v redis-check-rdb >/dev/null && redis-check-rdb /data/dump.rdb >/dev/null'
+  container_rdb_sha="$(
+    docker exec "${REDIS_CONTAINER}" sh -lc \
+      'sha256sum /data/dump.rdb | awk "{print \$1}"'
+  )"
   docker cp \
     "${REDIS_CONTAINER}:/data/dump.rdb" \
     "${BACKUP_DIR}/redis-dump.rdb" >/dev/null
   [[ -s "${BACKUP_DIR}/redis-dump.rdb" ]] ||
     die "Redis RDB backup is empty."
+  backup_rdb_sha="$(
+    sha256sum "${BACKUP_DIR}/redis-dump.rdb" |
+      awk '{print $1}'
+  )"
+  [[ "${backup_rdb_sha}" == "${container_rdb_sha}" ]] ||
+    die "Redis RDB checksum changed while copying the snapshot."
 
-  log "Redis RDB 备份完成并校验非空：$(human_bytes "$(stat -c '%s' "${BACKUP_DIR}/redis-dump.rdb")")"
+  log "Redis RDB 备份通过结构与 SHA-256 校验：$(human_bytes "$(stat -c '%s' "${BACKUP_DIR}/redis-dump.rdb")")"
 }
 
 write_and_verify_checksums() {
@@ -597,12 +946,28 @@ write_and_verify_checksums() {
       docker-compose.yml.before-upgrade \
       .env \
       app-data.tar.gz \
+      compose-images.before.txt \
+      fstab \
       metadata.txt \
+      target-release.json \
       target-image.txt \
+      target-migrations.txt \
+      official-compose.current.yml \
+      official-compose.target.yml \
+      official-env.current.example \
+      official-env.target.example \
+      schema-migrations.before.tsv \
+      schema-migrations.before.txt \
       sub2api.pgdump \
       postgres-globals.sql \
       redis-dump.rdb \
       > SHA256SUMS
+    if [[ -f docker-10-requires-srv.conf ]]; then
+      sha256sum docker-10-requires-srv.conf >> SHA256SUMS
+    fi
+    if [[ -f Caddyfile ]]; then
+      sha256sum Caddyfile >> SHA256SUMS
+    fi
     if [[ -f config.yaml ]]; then
       sha256sum config.yaml >> SHA256SUMS
     fi
@@ -620,13 +985,18 @@ write_and_verify_checksums() {
 
 pull_target_image() {
   local target_image="$1"
+  local target_version="$2"
+  local current_version="$3"
   local image_platform
   local image_size
   local image_digest
 
   log "正在拉取目标镜像（此步骤不会触碰当前运行容器）：${target_image}"
+  fetch_and_verify_official_release "${target_version}"
+  verify_upstream_deployment_contract "${current_version}" "${target_version}"
   docker pull "${target_image}"
-  docker image inspect "${target_image}" >/dev/null
+  verify_image_identity "${target_image}" "${target_version}"
+  fetch_target_migration_manifest "${target_version}"
 
   image_platform="$(
     docker image inspect \
@@ -641,9 +1011,9 @@ pull_target_image() {
   )"
 
   docker image inspect \
-    -f 'target_image_id={{.Id}} target_repo_digests={{json .RepoDigests}}' \
+    -f 'target_image_id={{.Id}} target_repo_digests={{json .RepoDigests}} source={{index .Config.Labels "org.opencontainers.image.source"}} version={{index .Config.Labels "org.opencontainers.image.version"}} revision={{index .Config.Labels "org.opencontainers.image.revision"}}' \
     "${target_image}" > "${BACKUP_DIR}/target-image.txt"
-  log "目标镜像校验完成：平台 ${image_platform}，大小 $(human_bytes "${image_size}")"
+  log "目标镜像校验完成：官方来源、版本标签、平台 ${image_platform}，大小 $(human_bytes "${image_size}")"
   log "目标镜像摘要：${image_digest:-未提供}"
 }
 
@@ -673,7 +1043,11 @@ confirm_cutover() {
       die "Application became unhealthy during the automatic cutover wait."
     check_local_health ||
       die "Local health endpoint failed during the automatic cutover wait."
-    log "切换前二次检查通过：旧应用 healthy，本地健康接口 HTTP 200。"
+    if [[ -n "${PUBLIC_HEALTH_URL}" ]]; then
+      check_public_health ||
+        die "Public health endpoint failed during the automatic cutover wait."
+    fi
+    log "切换前二次检查通过：旧应用 healthy，已配置的健康接口均为 HTTP 200/status=ok。"
     return 0
   fi
 
@@ -739,8 +1113,10 @@ wait_for_application_health() {
       return 1
     fi
 
-    if [[ "${state}" == "healthy" && "${http_code}" == "200" ]]; then
-      log "新应用已就绪：container=healthy，health HTTP=200，等待耗时 $(format_duration "$((SECONDS - started_at))")"
+    if [[ "${state}" == "healthy" &&
+      "${http_code}" == "200" ]] &&
+      health_body_is_ok "${LOCAL_HEALTH_URL}"; then
+      log "新应用已就绪：container=healthy，health HTTP=200 且 status=ok，等待耗时 $(format_duration "$((SECONDS - started_at))")"
       return 0
     fi
     if (( SECONDS - last_report >= 4 )); then
@@ -754,34 +1130,90 @@ wait_for_application_health() {
   return 1
 }
 
-verify_target_migrations() {
-  local migration_rows
-  local migration_count
+query_schema_migrations() {
+  docker exec "${PG_CONTAINER}" sh -lc \
+    'exec psql -X -qAt -F "|" -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT filename, checksum FROM schema_migrations;"' |
+    LC_ALL=C sort -t '|' -k1,1
+}
 
-  migration_rows="$(
-    docker exec -i "${PG_CONTAINER}" sh -lc \
-      'exec psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
-      <<'SQL'
-SELECT filename
-FROM schema_migrations
-WHERE filename IN (
-  '172_composite_model_routes.sql',
-  '185_group_reasoning_effort_policy.sql',
-  '186_alipay_mobile_precreate_deep_link.sql',
-  '186_group_auth_cache_image_generation.sql'
-)
-ORDER BY filename;
-SQL
+migration_baseline_unchanged() {
+  [[ -s "${MIGRATION_BASELINE_FILE}" ]] || return 1
+  cmp -s "${MIGRATION_BASELINE_FILE}" <(query_schema_migrations)
+}
+
+verify_target_migrations() {
+  local after_file="${BACKUP_DIR}/schema-migrations.after.tsv"
+  local after_names="${BACKUP_DIR}/schema-migrations.after.txt"
+  local missing_file="${BACKUP_DIR}/schema-migrations.missing.txt"
+  local extra_file="${BACKUP_DIR}/schema-migrations.extra.txt"
+  local changed_baseline_file="${BACKUP_DIR}/schema-migrations.baseline-changed.txt"
+  local new_file="${BACKUP_DIR}/schema-migrations.new.txt"
+  local expected_count
+  local actual_count
+  local new_count
+
+  query_schema_migrations > "${after_file}"
+  [[ -s "${after_file}" ]] || die "Post-upgrade migration table is empty."
+  awk -F '|' 'NF {print $1}' "${after_file}" |
+    LC_ALL=C sort -u > "${after_names}"
+
+  LC_ALL=C comm -23 \
+    "${TARGET_MIGRATIONS_FILE}" \
+    "${after_names}" > "${missing_file}"
+  LC_ALL=C comm -13 \
+    "${TARGET_MIGRATIONS_FILE}" \
+    "${after_names}" > "${extra_file}"
+  LC_ALL=C comm -23 \
+    "${MIGRATION_BASELINE_FILE}" \
+    "${after_file}" > "${changed_baseline_file}"
+
+  if [[ -s "${missing_file}" || -s "${extra_file}" ||
+    -s "${changed_baseline_file}" ]]; then
+    [[ ! -s "${missing_file}" ]] || {
+      warn "数据库缺少目标版本迁移："
+      sed 's/^/  [缺失] /' "${missing_file}" >&2
+    }
+    [[ ! -s "${extra_file}" ]] || {
+      warn "数据库存在目标版本清单之外的迁移："
+      sed 's/^/  [额外] /' "${extra_file}" >&2
+    }
+    [[ ! -s "${changed_baseline_file}" ]] || {
+      warn "升级前迁移记录或校验和发生变化："
+      sed 's/^/  [变化] /' "${changed_baseline_file}" >&2
+    }
+    die "Post-upgrade database migration manifest verification failed."
+  fi
+
+  rm -f -- "${missing_file}" "${extra_file}" "${changed_baseline_file}"
+  LC_ALL=C comm -13 \
+    "${MIGRATION_BASELINE_NAMES_FILE}" \
+    "${after_names}" > "${new_file}"
+
+  expected_count="$(
+    awk 'NF {count++} END {print count + 0}' "${TARGET_MIGRATIONS_FILE}"
   )"
-  migration_count="$(
-    awk 'NF {count++} END {print count + 0}' <<<"${migration_rows}"
+  actual_count="$(
+    awk 'NF {count++} END {print count + 0}' "${after_names}"
   )"
-  [[ "${migration_count}" == "4" ]] ||
-    die "Expected 4 target migrations, but database reports ${migration_count:-none}."
-  log "数据库迁移记录核对通过（4/4）："
-  while IFS= read -r migration; do
-    [[ -n "${migration}" ]] && printf '  [已应用] %s\n' "${migration}"
-  done <<<"${migration_rows}"
+  new_count="$(
+    awk 'NF {count++} END {print count + 0}' "${new_file}"
+  )"
+
+  log "数据库迁移清单核对通过：官方目标 ${expected_count} 条，数据库 ${actual_count} 条，本次新增 ${new_count} 条。"
+  if (( new_count > 0 )); then
+    sed 's/^/  [本次新增] /' "${new_file}"
+  else
+    log "本次版本没有新增数据库迁移。"
+  fi
+  (
+    cd "${BACKUP_DIR}"
+    sha256sum \
+      schema-migrations.after.tsv \
+      schema-migrations.after.txt \
+      schema-migrations.new.txt \
+      > POST-UPGRADE-SHA256SUMS
+    sha256sum -c POST-UPGRADE-SHA256SUMS >/dev/null
+  )
 }
 
 save_container_logs() {
@@ -857,13 +1289,23 @@ restore_old_application() {
     save_container_logs "${BACKUP_DIR}/failed-target-container.log"
   fi
 
+  if (( CUTOVER_STARTED == 1 )) && ! migration_baseline_unchanged; then
+    warn "数据库迁移集合已变化或无法核对；根据 Sub2API 的前向迁移规则，拒绝自动启动旧应用镜像。"
+    warn "目标 Compose 保持不变，PostgreSQL/Redis 未停止；请查看失败日志后决定修复目标版本还是显式恢复数据库。"
+    if [[ -n "${BACKUP_DIR}" ]]; then
+      printf 'AUTO_ROLLBACK_SKIPPED_SCHEMA_CHANGED %s\n' "$(timestamp)" \
+        >> "${BACKUP_DIR}/STATUS"
+    fi
+    return 1
+  fi
+
   if [[ -n "${ORIGINAL_COMPOSE_BACKUP}" && -f "${ORIGINAL_COMPOSE_BACKUP}" ]]; then
     cp -a "${ORIGINAL_COMPOSE_BACKUP}" "${COMPOSE_FILE}"
     COMPOSE_EDITED=0
 
     if compose config -q; then
       warn "原 Compose 已恢复，正在重新创建旧应用容器..."
-      compose up -d --no-deps --force-recreate "${APP_SERVICE}"
+      compose up -d --no-deps --force-recreate --pull never "${APP_SERVICE}"
       if wait_for_application_health; then
         warn "自动回退成功：旧应用镜像已恢复并通过健康检查。"
         if [[ -n "${BACKUP_DIR}" ]]; then
@@ -913,7 +1355,7 @@ handle_error() {
   elif (( CUTOVER_STARTED == 0 && COMPOSE_EDITED == 1 )); then
     warn "Compose 已修改但尚未停容器；将恢复原 Compose。"
   else
-    warn "已进入容器切换阶段；现在启动自动应用回退。"
+    warn "已进入容器切换阶段；现在先核对迁移集合，再决定是否允许自动应用回退。"
   fi
 
   if (( COMPOSE_EDITED == 1 || CUTOVER_STARTED == 1 )); then
@@ -965,16 +1407,32 @@ perform_upgrade() {
   target_image="${IMAGE_REPOSITORY}:${target_version}"
 
   if [[ "${current_version}" == "${target_version}" ]]; then
+    for container in "${APP_CONTAINER}" "${PG_CONTAINER}" "${REDIS_CONTAINER}"; do
+      container_exists "${container}" || die "Container not found: ${container}"
+      container_running "${container}" || die "Container is not running: ${container}"
+      [[ "$(container_health "${container}")" == "healthy" ]] ||
+        die "Container is not healthy: ${container}"
+    done
+    validate_runtime_layout
+    verify_image_identity "${current_image}" "${current_version}"
+    check_local_health || die "Local health endpoint failed."
+    if [[ -n "${PUBLIC_HEALTH_URL}" ]]; then
+      check_public_health || die "Public health endpoint failed."
+    fi
     log "当前 Compose 已经是官方最新版本 ${target_image}，无需升级。"
     print_status
     return 0
   fi
+  version_is_newer "${current_version}" "${target_version}" ||
+    die "Refusing non-forward upgrade: current=${current_version}, target=${target_version}."
 
   stage_start "只读预检当前生产环境"
   for container in "${APP_CONTAINER}" "${PG_CONTAINER}" "${REDIS_CONTAINER}"; do
     container_exists "${container}" || die "Container not found: ${container}"
     container_running "${container}" || die "Container is not running: ${container}"
   done
+  validate_runtime_layout
+  verify_image_identity "${current_image}" "${current_version}"
   [[ "$(container_health "${APP_CONTAINER}")" == "healthy" ]] ||
     die "Application container is not healthy before upgrade."
   [[ "$(container_health "${PG_CONTAINER}")" == "healthy" ]] ||
@@ -982,6 +1440,9 @@ perform_upgrade() {
   [[ "$(container_health "${REDIS_CONTAINER}")" == "healthy" ]] ||
     die "Redis container is not healthy before upgrade."
   check_local_health || die "Local health endpoint failed before upgrade."
+  if [[ -n "${PUBLIC_HEALTH_URL}" ]]; then
+    check_public_health || die "Public health endpoint failed before upgrade."
+  fi
 
   if (( $(free_space_gb) < MIN_FREE_GB )); then
     die "Insufficient free space for image pull and fresh backups."
@@ -1002,11 +1463,12 @@ perform_upgrade() {
   stage_finish
 
   stage_start "拉取并校验目标 Docker 镜像"
-  pull_target_image "${target_image}"
+  pull_target_image "${target_image}" "${target_version}" "${current_version}"
   stage_finish
 
   stage_start "创建并验证 PostgreSQL 备份"
   backup_postgresql
+  verify_baseline_against_target_manifest "${target_version}"
   stage_finish
 
   stage_start "创建并验证 Redis 备份"
@@ -1032,7 +1494,7 @@ perform_upgrade() {
   log "旧应用容器已停止，实时状态：$(container_health "${APP_CONTAINER}")"
 
   log "正在使用 ${target_image} 创建新应用容器..."
-  compose up -d --no-deps --force-recreate "${APP_SERVICE}"
+  compose up -d --no-deps --force-recreate --pull never "${APP_SERVICE}"
   log "新容器已创建，当前 Docker 状态：$(container_health "${APP_CONTAINER}")"
   stage_finish
 
@@ -1042,9 +1504,11 @@ perform_upgrade() {
 
   [[ "$(docker inspect -f '{{.Config.Image}}' "${APP_CONTAINER}")" == "${target_image}" ]] ||
     die "Running container does not use ${target_image}."
+  verify_image_identity "${target_image}" "${target_version}"
   log "运行镜像核对通过：${target_image}"
 
   verify_target_migrations
+  validate_runtime_layout
   save_container_logs "${BACKUP_DIR}/post-upgrade-container.log"
   log "新容器最近日志已保存：${BACKUP_DIR}/post-upgrade-container.log"
   compose ps
@@ -1057,9 +1521,9 @@ perform_upgrade() {
     PUBLIC_HEALTH_FAILED=0
     log "公网健康检查已跳过：未设置 PUBLIC_HEALTH_URL。"
   elif check_public_health; then
-    PUBLIC_HEALTH_STATUS="HTTP 200"
+    PUBLIC_HEALTH_STATUS="HTTP 200 / status=ok"
     PUBLIC_HEALTH_FAILED=0
-    log "公网健康检查通过：HTTP 200 (${PUBLIC_HEALTH_URL})"
+    log "公网健康检查通过：HTTP 200 且 status=ok (${PUBLIC_HEALTH_URL})"
   else
     PUBLIC_HEALTH_STATUS="失败"
     PUBLIC_HEALTH_FAILED=1
@@ -1114,12 +1578,14 @@ perform_manual_rollback() {
   local saved_compose
   local rollback_record_dir
   local source_image
+  local saved_migration_baseline
   local stamp
 
   require_root
   require_commands
   acquire_lock
   validate_layout
+  validate_cleanup_settings
 
   [[ -n "${source_backup}" ]] ||
     die "Specify the upgrade backup directory to roll back from."
@@ -1136,6 +1602,19 @@ perform_manual_rollback() {
   )"
   [[ "${source_image}" == "${IMAGE_REPOSITORY}:"* ]] ||
     die "Backup does not contain a recognized Sub2API image."
+
+  saved_migration_baseline="${source_backup}/schema-migrations.before.tsv"
+  if [[ ! -s "${saved_migration_baseline}" ]]; then
+    [[ "${ALLOW_SCHEMA_MISMATCH_ROLLBACK}" == "1" ]] ||
+      die "Backup has no migration baseline; refusing image rollback. Set ALLOW_SCHEMA_MISMATCH_ROLLBACK=1 only after manual schema compatibility review."
+    warn "备份缺少迁移基线；已根据显式 ALLOW_SCHEMA_MISMATCH_ROLLBACK=1 继续。"
+  elif ! cmp -s "${saved_migration_baseline}" <(query_schema_migrations); then
+    [[ "${ALLOW_SCHEMA_MISMATCH_ROLLBACK}" == "1" ]] ||
+      die "Database migration set differs from the rollback backup; refusing an unsafe image-only rollback."
+    warn "数据库迁移集合与旧镜像备份不同；已根据显式 ALLOW_SCHEMA_MISMATCH_ROLLBACK=1 继续。"
+  else
+    log "数据库迁移集合与回退备份一致，允许应用镜像回退。"
+  fi
 
   confirm_rollback "${source_backup}"
   docker pull "${source_image}"
@@ -1155,7 +1634,7 @@ perform_manual_rollback() {
 
   log "Stopping only the application container..."
   compose stop -t "${STOP_TIMEOUT_SECONDS}" "${APP_SERVICE}"
-  compose up -d --no-deps --force-recreate "${APP_SERVICE}"
+  compose up -d --no-deps --force-recreate --pull never "${APP_SERVICE}"
 
   if ! wait_for_application_health; then
     warn "Old application image is unhealthy; restoring the pre-rollback Compose file."
@@ -1164,7 +1643,7 @@ perform_manual_rollback() {
       "${rollback_record_dir}/docker-compose.yml.before-rollback" \
       "${COMPOSE_FILE}"
     compose config -q
-    compose up -d --no-deps --force-recreate "${APP_SERVICE}"
+    compose up -d --no-deps --force-recreate --pull never "${APP_SERVICE}"
     wait_for_application_health ||
       die "Both rollback and recovery application images are unhealthy."
     die "Rollback failed; the pre-rollback application image was restored."
@@ -1192,6 +1671,8 @@ main() {
       require_commands
       acquire_lock
       validate_layout
+      validate_runtime_layout
+      verify_image_identity "$(get_current_image)" "$(get_current_version)"
       print_status
       ;;
     upgrade)

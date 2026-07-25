@@ -10,10 +10,9 @@ REPO_ROOT="$(
 # shellcheck source=../sub2api-safe-upgrade.sh
 source "${REPO_ROOT}/sub2api-safe-upgrade.sh"
 
-CURRENT_IMAGE_TEST="weishaw/sub2api:0.1.162"
+CURRENT_IMAGE_TEST="weishaw/sub2api:0.1.164"
 PUBLIC_HEALTH_URL="https://example.invalid/health"
 AUTO_CUTOVER_WAIT_SECONDS=0
-DELETE_SCRIPT_ON_SUCCESS=0
 TEST_BACKUP_DIR=""
 
 cleanup_test_directory() {
@@ -27,6 +26,10 @@ require_root() { :; }
 require_commands() { :; }
 acquire_lock() { :; }
 validate_layout() { :; }
+validate_runtime_layout() { :; }
+verify_image_identity() { :; }
+fetch_and_verify_official_release() { :; }
+verify_upstream_deployment_contract() { :; }
 container_exists() { :; }
 container_running() { :; }
 container_health() { printf 'healthy\n'; }
@@ -36,11 +39,12 @@ get_current_image() { printf '%s\n' "${CURRENT_IMAGE_TEST}"; }
 get_current_version() {
   printf '%s\n' "${CURRENT_IMAGE_TEST#weishaw/sub2api:}"
 }
-fetch_latest_official_version() { printf '0.1.164\n'; }
+fetch_latest_official_version() { printf '0.1.165\n'; }
 print_status() { :; }
 backup_configuration() { :; }
 pull_target_image() { :; }
 backup_postgresql() { :; }
+verify_baseline_against_target_manifest() { :; }
 backup_redis() { :; }
 confirm_cutover() { :; }
 compose() { :; }
@@ -73,7 +77,7 @@ docker() {
 
 perform_upgrade latest
 
-[[ "${CURRENT_IMAGE_TEST}" == "weishaw/sub2api:0.1.164" ]]
+[[ "${CURRENT_IMAGE_TEST}" == "weishaw/sub2api:0.1.165" ]]
 grep -q 'UPGRADE_SUCCESS' "${BACKUP_DIR}/STATUS"
 [[ -f "${REPO_ROOT}/sub2api-safe-upgrade.sh" ]]
 
